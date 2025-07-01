@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import ffmpeg
 import soundfile as sf
+import re
 
 
 class SpeechDataset:
@@ -94,15 +95,57 @@ class SpeechDataset:
         self._vprint("Ending training session...")
         requests.post(url)
 
-    def _load_and_preprocess_batch_item(self, item):
+    def _parse_vtt_segments(self, vtt_text):
+        pattern = re.compile(r"(\d+):(\d+\.\d+)\s*-->\s*(\d+):(\d+\.\d+)")
+        segments = []
+        for line in vtt_text.splitlines():
+            match = pattern.match(line)
+            if match:
+                start = int(match.group(1)) * 60 + float(match.group(2))
+                end = int(match.group(3)) * 60 + float(match.group(4))
+                if end > start:
+                    segments.append((start, end))
+        return segments
+
+    def _extract_window(self, waveform, sr, segments, target_seconds):
+        target_len = int(target_seconds * sr)
+        best_chunk = None
+        best_len = 0
+
+        for start, end in segments:
+            start_i = int(start * sr)
+            end_i = int(end * sr)
+            if end_i <= len(waveform):
+                length = end_i - start_i
+                if best_len < length <= target_len:
+                    best_chunk = waveform[start_i:end_i]
+                    best_len = length
+                    if best_len == target_len:
+                        break
+
+        if best_chunk is None:
+            return None, None
+
+        pad_len = target_len - len(best_chunk)
+        padded = np.pad(best_chunk, (0, pad_len), constant_values=0.0)
+        mask = np.zeros(target_len, dtype=np.float32)
+        mask[:len(best_chunk)] = 1.0
+        return padded, mask
+
+    def _load_and_preprocess_batch_item(self, item, target_duration=30.0):
         audio_url = item["cache_audio_url"]
-        transcript_url = item["transcript_file"]
+        transcript_url = item["transcript_file"].replace('/var/www/', 'https://')
 
         self._vprint(f"Downloading audio from {audio_url}")
         audio_resp = requests.get(audio_url, timeout=10)
         audio_resp.raise_for_status()
 
-        # Convert to 16kHz mono WAV using ffmpeg
+        self._vprint(f"Downloading transcript from {transcript_url}")
+        transcript_resp = requests.get(transcript_url, timeout=10)
+        transcript_resp.raise_for_status()
+        transcript_text = transcript_resp.text
+        segments = self._parse_vtt_segments(transcript_text)
+
         try:
             out, _ = (
                 ffmpeg.input("pipe:0")
@@ -114,18 +157,16 @@ class SpeechDataset:
             print(e.stderr.decode('utf-8'))
             raise
 
-        wav_data, _ = sf.read(io.BytesIO(out), dtype='int16')
-        audio_float = wav_data.astype(np.float32) / 32767.0
-        audio_tensor = torch.from_numpy(audio_float)
+        waveform, sr = sf.read(io.BytesIO(out), dtype='float32')
+        assert sr == 16000
 
-        self._vprint(f"Downloading transcript from {transcript_url}")
-        transcript_resp = requests.get(transcript_url, timeout=10)
-        transcript_resp.raise_for_status()
-        transcript_text = transcript_resp.text
+        sample, mask = self._extract_window(waveform, sr, segments, target_duration)
+        if sample is None:
+            raise ValueError("No suitable segment found for target duration")
 
-        return audio_tensor, transcript_text
+        return torch.from_numpy(sample), torch.from_numpy(mask)
 
-    def simulate_training_loop(self, steps=None, sleep=1.0):
+    def simulate_training_loop(self, steps=None, sleep=1.0, target_duration=30.0):
         step_count = 0
         while True:
             try:
@@ -139,18 +180,16 @@ class SpeechDataset:
             for i, item in enumerate(batch):
                 self._vprint(f"Processing item {i + 1}/{len(batch)}")
                 try:
-                    audio_tensor, transcript_text = self._load_and_preprocess_batch_item(item)
-                    self._vprint(f"Loaded audio tensor shape: {audio_tensor.shape}")
-                    # Use `audio_tensor` and `transcript_text` for training
+                    audio_tensor, mask = self._load_and_preprocess_batch_item(item, target_duration=target_duration)
+                    self._vprint(f"Audio shape: {audio_tensor.shape}, Mask shape: {mask.shape}")
+                    # Use audio_tensor and mask in training loop
                 except Exception as e:
                     self._vprint(f"[ERROR] Failed to process item: {e}")
                     continue
 
             time.sleep(sleep)
-
             self.mark_batch_done(epoch, batch_id)
             self.log("INFO", f"Completed batch with offset {batch_id} in epoch {epoch}")
-
             step_count += 1
             if steps and step_count >= steps:
                 break
@@ -168,6 +207,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_duration", type=float, default=None, help="Maximum duration filter")
     parser.add_argument("--steps", type=int, default=None, help="Max number of batches to process")
     parser.add_argument("--sleep", type=float, default=1.0, help="Sleep time per batch (simulate training)")
+    parser.add_argument("--target_duration", type=float, default=30.0, help="Target audio segment duration in seconds")
     parser.add_argument("--verbose", action="store_true", help="Print detailed debug output")
     args = parser.parse_args()
 
@@ -178,5 +218,5 @@ if __name__ == "__main__":
         min_duration=args.min_duration,
         max_duration=args.max_duration
     )
-    dataset.simulate_training_loop(steps=args.steps, sleep=args.sleep)
+    dataset.simulate_training_loop(steps=args.steps, sleep=args.sleep, target_duration=args.target_duration)
 
