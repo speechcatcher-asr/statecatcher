@@ -2,6 +2,11 @@ import argparse
 import yaml
 import requests
 import time
+import io
+import numpy as np
+import torch
+import ffmpeg
+import soundfile as sf
 
 
 class SpeechDataset:
@@ -59,7 +64,7 @@ class SpeechDataset:
         result = response.json()
         if not result.get("success"):
             raise RuntimeError(f"Error fetching batch: {result.get('error', 'Unknown error')}")
-        
+
         return result["epoch"], result["batch_id"], result["batch"]
 
     def mark_batch_done(self, epoch, batch_id):
@@ -89,17 +94,58 @@ class SpeechDataset:
         self._vprint("Ending training session...")
         requests.post(url)
 
+    def _load_and_preprocess_batch_item(self, item):
+        audio_url = item["cache_audio_url"]
+        transcript_url = item["transcript_file"]
+
+        self._vprint(f"Downloading audio from {audio_url}")
+        audio_resp = requests.get(audio_url, timeout=10)
+        audio_resp.raise_for_status()
+
+        # Convert to 16kHz mono WAV using ffmpeg
+        try:
+            out, _ = (
+                ffmpeg.input("pipe:0")
+                .output('pipe:', format='wav', acodec='pcm_s16le', ac=1, ar='16000')
+                .run(input=audio_resp.content, capture_stdout=True, capture_stderr=True)
+            )
+        except ffmpeg.Error as e:
+            print("FFmpeg error occurred:")
+            print(e.stderr.decode('utf-8'))
+            raise
+
+        wav_data, _ = sf.read(io.BytesIO(out), dtype='int16')
+        audio_float = wav_data.astype(np.float32) / 32767.0
+        audio_tensor = torch.from_numpy(audio_float)
+
+        self._vprint(f"Downloading transcript from {transcript_url}")
+        transcript_resp = requests.get(transcript_url, timeout=10)
+        transcript_resp.raise_for_status()
+        transcript_text = transcript_resp.text
+
+        return audio_tensor, transcript_text
+
     def simulate_training_loop(self, steps=None, sleep=1.0):
         step_count = 0
         while True:
             try:
                 epoch, batch_id, batch = self.fetch_next_batch()
-                print('batch:', batch)
             except RuntimeError as e:
                 print(f"[ERROR] Stopped training: {e}")
                 break
 
             self._vprint(f"Training on batch with offset {batch_id} from epoch {epoch} ({len(batch)} samples)...")
+
+            for i, item in enumerate(batch):
+                self._vprint(f"Processing item {i + 1}/{len(batch)}")
+                try:
+                    audio_tensor, transcript_text = self._load_and_preprocess_batch_item(item)
+                    self._vprint(f"Loaded audio tensor shape: {audio_tensor.shape}")
+                    # Use `audio_tensor` and `transcript_text` for training
+                except Exception as e:
+                    self._vprint(f"[ERROR] Failed to process item: {e}")
+                    continue
+
             time.sleep(sleep)
 
             self.mark_batch_done(epoch, batch_id)
