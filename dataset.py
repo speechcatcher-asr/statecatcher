@@ -72,7 +72,6 @@ class SpeechDataset:
         url = f"{self.api_url}/mark_batch_done/{self.session_id}/{batch_id}/{self.api_key}?epoch={epoch}"
         self._vprint(f"Marking batch {batch_id} from epoch {epoch} as done...")
         response = requests.post(url)
-
         if not response.ok:
             print(f"[WARN] Failed to mark batch done. HTTP {response.status_code}")
             try:
@@ -80,7 +79,6 @@ class SpeechDataset:
             except Exception:
                 print(f"[WARN] Non-JSON response: {response.text}")
             return
-
         result = response.json()
         if not result.get("success"):
             print(f"[WARN] API error marking batch done: {result.get('error', 'Unknown error')}")
@@ -95,17 +93,26 @@ class SpeechDataset:
         self._vprint("Ending training session...")
         requests.post(url)
 
-    def _parse_vtt_segments(self, vtt_text):
-        pattern = re.compile(r"(\d+):(\d+\.\d+)\s*-->\s*(\d+):(\d+\.\d+)")
+    def _parse_vtt_segments_and_text(self, vtt_text):
         segments = []
-        for line in vtt_text.splitlines():
-            match = pattern.match(line)
+        texts = []
+        time_re = re.compile(r"(\d+):(\d+\.\d+)\s*-->\s*(\d+):(\d+\.\d+)")
+        lines = vtt_text.strip().splitlines()
+        current_caption = ""
+        for line in lines:
+            match = time_re.match(line)
             if match:
+                if current_caption:
+                    texts.append(current_caption.strip())
+                    current_caption = ""
                 start = int(match.group(1)) * 60 + float(match.group(2))
                 end = int(match.group(3)) * 60 + float(match.group(4))
-                if end > start:
-                    segments.append((start, end))
-        return segments
+                segments.append((start, end))
+            elif line and not line.startswith("WEBVTT"):
+                current_caption += " " + line
+        if current_caption:
+            texts.append(current_caption.strip())
+        return segments, " ".join(texts).strip()
 
     def _extract_window(self, waveform, sr, segments, target_seconds):
         target_len = int(target_seconds * sr)
@@ -143,8 +150,8 @@ class SpeechDataset:
         self._vprint(f"Downloading transcript from {transcript_url}")
         transcript_resp = requests.get(transcript_url, timeout=10)
         transcript_resp.raise_for_status()
-        transcript_text = transcript_resp.text
-        segments = self._parse_vtt_segments(transcript_text)
+        vtt_text = transcript_resp.text
+        segments, full_text = self._parse_vtt_segments_and_text(vtt_text)
 
         try:
             out, _ = (
@@ -164,7 +171,7 @@ class SpeechDataset:
         if sample is None:
             raise ValueError("No suitable segment found for target duration")
 
-        return torch.from_numpy(sample), torch.from_numpy(mask)
+        return torch.from_numpy(sample), torch.from_numpy(mask), full_text
 
     def simulate_training_loop(self, steps=None, sleep=1.0, target_duration=30.0):
         step_count = 0
@@ -177,17 +184,37 @@ class SpeechDataset:
 
             self._vprint(f"Training on batch with offset {batch_id} from epoch {epoch} ({len(batch)} samples)...")
 
+            waveforms = []
+            masks = []
+            transcripts = []
+
             for i, item in enumerate(batch):
                 self._vprint(f"Processing item {i + 1}/{len(batch)}")
                 try:
-                    audio_tensor, mask = self._load_and_preprocess_batch_item(item, target_duration=target_duration)
-                    self._vprint(f"Audio shape: {audio_tensor.shape}, Mask shape: {mask.shape}")
-                    # Use audio_tensor and mask in training loop
+                    audio_tensor, mask_tensor, transcript = self._load_and_preprocess_batch_item(item, target_duration=target_duration)
+                    waveforms.append(audio_tensor)
+                    masks.append(mask_tensor)
+                    transcripts.append(transcript)
                 except Exception as e:
                     self._vprint(f"[ERROR] Failed to process item: {e}")
                     continue
 
+            if not waveforms:
+                self._vprint("No valid items in batch, skipping...")
+                continue
+
+            batch_tensor = {
+                "waveforms": torch.stack(waveforms),
+                "masks": torch.stack(masks),
+                "transcripts": transcripts
+            }
+
+            self._vprint(f"Batch tensor shapes: waveforms={batch_tensor['waveforms'].shape}, masks={batch_tensor['masks'].shape}")
+            self._vprint(f"First transcript: {batch_tensor['transcripts'][0][:100]}...")
+
+            # Simulate training logic here with `batch_tensor`
             time.sleep(sleep)
+
             self.mark_batch_done(epoch, batch_id)
             self.log("INFO", f"Completed batch with offset {batch_id} in epoch {epoch}")
             step_count += 1
