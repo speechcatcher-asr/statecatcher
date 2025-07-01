@@ -35,7 +35,7 @@ class SpeechDataset:
             result = response.json()
             if result["success"]:
                 self.session_id = result["session_id"]
-                self._vprint(f"Started session {self.session_id} with {result['num_samples']} samples.")
+                self._vprint(f"Started session {self.session_id}")
             else:
                 raise RuntimeError(f"Failed to start session: {result['error']}")
         else:
@@ -94,15 +94,16 @@ class SpeechDataset:
         while True:
             try:
                 epoch, batch_id, batch = self.fetch_next_batch()
+                print('batch:', batch)
             except RuntimeError as e:
                 print(f"[ERROR] Stopped training: {e}")
                 break
 
-            self._vprint(f"Training on batch {batch_id} from epoch {epoch} ({len(batch)} samples)...")
+            self._vprint(f"Training on batch with offset {batch_id} from epoch {epoch} ({len(batch)} samples)...")
             time.sleep(sleep)
 
             self.mark_batch_done(epoch, batch_id)
-            self.log("INFO", f"Completed batch {batch_id} in epoch {epoch}")
+            self.log("INFO", f"Completed batch with offset {batch_id} in epoch {epoch}")
 
             step_count += 1
             if steps and step_count >= steps:
