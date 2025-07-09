@@ -219,116 +219,27 @@ class SpeechDataset:
 
         return segment_tensors, segment_texts, segment_masks
 
+    def _plot_batch_waveforms(self, batch_audio, batch_texts, epoch, batch_id, seg_idx):
+        """
+        Plot a single “vertical slice” of waveforms (one segment index across all batch items),
+        and save to: plots/batch{epoch}_batch{batch_id}_segment{seg_idx}.pdf
+        """
+        num_items = len(batch_audio)
+        fig = plt.figure(figsize=(12, 2.5 * num_items))
 
-    def _plot_batch_waveforms(self, batch_audio_items, batch_texts_items, epoch, batch_id):
-        num_items = len(batch_audio_items)
-        counts = [len(seq) for seq in batch_audio_items]
-        if self.batch_segment_strategy == "clipping":
-            K = min(counts)
-        else:
-            K = max(counts)
-        for seg_idx in range(K):
-            fig = plt.figure(figsize=(12, 2.5 * num_items))
-            for i in range(num_items):
-                seq, texts = batch_audio_items[i], batch_texts_items[i]
-                if seg_idx < len(seq):
-                    wave, title = seq[seg_idx], texts[seg_idx]
-                else:
-                    wave = torch.zeros_like(batch_audio_items[i][0])
-                    title = ""
-                ax = fig.add_subplot(num_items, 1, i+1)
-                ax.plot(wave.numpy())
-                ax.set_xlim(0, len(wave))
-                ax.set_ylabel(f"Item {i+1}")
-                ax.set_xticks([]); ax.set_yticks([])
-                ax.set_title(title, fontsize=8, pad=2)
-            plt.tight_layout()
-            fname = f"plots/batch{epoch:04d}_batch{batch_id:05d}_segment{seg_idx:05d}.pdf"
-            plt.savefig(fname); plt.close(fig)
-            self._vprint(f"Saved plot to {fname}")
+        for i, (waveform, text) in enumerate(zip(batch_audio, batch_texts)):
+            ax = fig.add_subplot(num_items, 1, i + 1)
+            ax.plot(waveform.numpy())
+            ax.set_xlim(0, len(waveform))
+            ax.set_ylabel(f"Item {i + 1}")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.set_title(text, fontsize=8, pad=2)
 
-    def simulate_training_loop(self, steps=None, sleep=1.0, target_duration=30.0):
-        step = 0; sr = 16000; target = int(sr * target_duration)
-        while True:
-            try:
-                epoch, batch_id, batch = self.fetch_next_batch()
-            except RuntimeError as e:
-                print(f"[ERROR] Stopped training: {e}"); break
+        plt.tight_layout()
+        fname = f"plots/batch{epoch:04d}_batch{batch_id:05d}_segment{seg_idx:05d}.pdf"
+        plt.savefig(fname)
+        plt.close(fig)
+        self._vprint(f"Saved plot to {fname}")
 
-            batch_audio_items, batch_texts_items, batch_masks_items = [], [], []
-            for itm in batch:
-                try:
-                    audios, texts, masks = self._load_and_preprocess_batch_item(itm, target)
-                    batch_audio_items.append(audios)
-                    batch_texts_items.append(texts)
-                    batch_masks_items.append(masks)
-                    self._vprint(f"Loaded item → segments: {len(audios)}")
-                except Exception as e:
-                    self._vprint(f"[ERROR] Skipping item: {e}")
-            if not batch_audio_items:
-                self._vprint("[WARN] No valid items. Skipping batch...")
-                continue
-
-            counts = [len(seq) for seq in batch_audio_items]
-            K = min(counts) if self.batch_segment_strategy=="clipping" else max(counts)
-
-            for seg_idx in range(K):
-                mini_audio, mini_mask = [], []
-                for i in range(len(batch_audio_items)):
-                    seq = batch_audio_items[i]
-                    mseq = batch_masks_items[i]
-                    if seg_idx < len(seq):
-                        mini_audio.append(seq[seg_idx])
-                        mini_mask.append(mseq[seg_idx])
-                    else:
-                        zeros = torch.zeros(target, dtype=torch.float32)
-                        mini_audio.append(zeros)
-                        mini_mask.append(torch.zeros(target, dtype=torch.bool))
-                batch_tensor = torch.stack(mini_audio)
-                mask_tensor  = torch.stack(mini_mask)
-
-                if self.debug_spectrograms:
-                    self._plot_batch_waveforms(batch_audio_items, batch_texts_items, epoch, batch_id)
-
-                self._vprint(f"Simulated train: segment {seg_idx+1}/{K}, batch size {batch_tensor.shape}")
-                time.sleep(sleep)
-
-            self.mark_batch_done(epoch, batch_id)
-            self.log("INFO", f"Completed batch {batch_id} @ epoch {epoch}")
-            step += 1
-            if steps and step >= steps:
-                break
-
-        self.end_session()
-
-  
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Simulated training client for speech data server")
-    parser.add_argument("--config", default="config.yaml", help="Path to config.yaml")
-    parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
-    parser.add_argument("--order", choices=["asc", "desc", "random"], default="asc", help="Sample order")
-    parser.add_argument("--min_duration", type=float, default=0.0, help="Minimum duration filter")
-    parser.add_argument("--max_duration", type=float, default=None, help="Maximum duration filter")
-    parser.add_argument("--steps", type=int, default=None, help="Max number of batches to process")
-    parser.add_argument("--sleep", type=float, default=1.0, help="Sleep time per batch (simulate training)")
-    parser.add_argument("--target_duration", type=float, default=30.0, help="Target duration in seconds per sample")
-    parser.add_argument("--verbose", action="store_true", help="Print detailed debug output")
-    parser.add_argument("--debug-spectrograms", action="store_true", help="Save waveform plots for debugging")
-
-    args = parser.parse_args()
-    dataset = SpeechDataset(
-        config_path=args.config,
-        verbose=args.verbose,
-        debug_spectrograms=args.debug_spectrograms
-    )
-    dataset.start_session(
-        batch_size=args.batch_size,
-        order=args.order,
-        min_duration=args.min_duration,
-        max_duration=args.max_duration
-    )
-    dataset.simulate_training_loop(
-        steps=args.steps,
-        sleep=args.sleep,
-        target_duration=args.target_duration
-    )
+    
