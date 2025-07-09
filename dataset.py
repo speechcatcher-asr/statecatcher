@@ -12,6 +12,7 @@ import soundfile as sf
 from matplotlib import pyplot as plt
 from matplotlib import gridspec
 from pathlib import Path
+from parse_vtts import vtt_to_segments_with_text, parse_timestamp
 
 class SpeechDataset:
     def __init__(self, config_path="config.yaml", verbose=False, debug_spectrograms=False):
@@ -101,23 +102,6 @@ class SpeechDataset:
         self._vprint("Ending training session...")
         requests.post(url)
 
-    def _vtt_to_segments(self, vtt_text):
-        segments = []
-        for line in vtt_text.splitlines():
-            if "-->" in line:
-                try:
-                    start, end = line.split("-->")
-                    start_sec = self._parse_timestamp(start.strip())
-                    end_sec = self._parse_timestamp(end.strip())
-                    segments.append((start_sec, end_sec))
-                except Exception:
-                    continue
-        return segments
-
-    def _parse_timestamp(self, timestamp):
-        h, m, s = timestamp.split(":")
-        return int(h) * 3600 + int(m) * 60 + float(s)
-
     def _load_and_preprocess_batch_item(self, item, target_samples):
         audio_url = item["cache_audio_url"]
         transcript_url = item["transcript_file"].replace('/var/www/', 'https://')
@@ -149,33 +133,33 @@ class SpeechDataset:
         except Exception as e:
             raise RuntimeError(f"Failed to fetch transcript: {e}")
 
-        segments = self._vtt_to_segments(transcript_text)
+        segments = vtt_to_segments_with_text(transcript_text)
+        print("segment:", segments)
         sr = 16000
         segment_tensors = []
-        for start, end in segments:
+        segment_texts = []
+
+        for start, end, text in segments:
             duration = end - start
             if duration >= target_samples / sr:
                 start_sample = int(start * sr)
                 end_sample = start_sample + target_samples
                 segment = audio_float[start_sample:end_sample]
                 segment_tensors.append(torch.from_numpy(segment))
+                segment_texts.append(text)
 
         if not segment_tensors:
             segment = np.zeros(target_samples, dtype=np.float32)
             seg_len = min(len(audio_float), len(segment))
             segment[:seg_len] = audio_float[:seg_len]
             segment_tensors.append(torch.from_numpy(segment))
+            segment_texts.append("")  # Empty text for padding segment
 
-        full_text = self._parse_vtt(transcript_text)
-        return segment_tensors, full_text
-
-    def _parse_vtt(self, vtt_text):
-        lines = vtt_text.strip().splitlines()
-        lines = [line.strip() for line in lines if line and not line.startswith("WEBVTT") and "-->" not in line]
-        return " ".join(lines)
+        return segment_tensors, segment_texts
 
     def _plot_batch_waveforms(self, batch_audio, batch_texts, epoch, batch_id):
         num_items = len(batch_audio)
+        self._vprint(f"Num items to plot in batch:", num_items)
         fig = plt.figure(figsize=(12, 2.5 * num_items))
         spec = gridspec.GridSpec(num_items, 1)
         for i, (waveform, text) in enumerate(zip(batch_audio, batch_texts)):
@@ -209,9 +193,10 @@ class SpeechDataset:
             for i, item in enumerate(batch):
                 self._vprint(f"Processing item {i + 1}/{len(batch)}")
                 try:
-                    audio_tensors, text = self._load_and_preprocess_batch_item(item, target_samples)
+                    audio_tensors, texts = self._load_and_preprocess_batch_item(item, target_samples)
+                    self._vprint(f"Audio tensor shapes: {[tensor.shape for tensor in audio_tensors]}, Texts: {texts}")
                     batch_audio.extend(audio_tensors)
-                    batch_texts.extend([text] * len(audio_tensors))
+                    batch_texts.extend(texts)
                 except Exception as e:
                     self._vprint(f"[ERROR] Failed to process item: {e}")
                     continue
