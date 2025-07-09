@@ -15,7 +15,7 @@ from pathlib import Path
 from parse_vtts import vtt_to_segments_with_text, parse_timestamp
 
 class SpeechDataset:
-    def __init__(self, config_path="config.yaml", verbose=False, debug_spectrograms=False):
+    def __init__(self, config_path="config.yaml", verbose=False, debug_spectrograms=False, batch_segment_strategy="clipping"):
         with open(config_path, "r") as f:
             self.config = yaml.safe_load(f)
         self.api_key = self.config["secret_api_key"]
@@ -24,6 +24,8 @@ class SpeechDataset:
         self.session_id = None
         self.verbose = verbose
         self.debug_spectrograms = debug_spectrograms
+        self.batch_segment_strategy = batch_segment_strategy  # 'clipping' or 'padding'
+
         if self.debug_spectrograms:
             Path("plots").mkdir(parents=True, exist_ok=True)
 
@@ -218,69 +220,88 @@ class SpeechDataset:
         return segment_tensors, segment_texts, segment_masks
 
 
-    def _plot_batch_waveforms(self, batch_audio, batch_texts, epoch, batch_id):
-        num_items = len(batch_audio)
-        self._vprint(f"Num items to plot in batch:", num_items)
-        fig = plt.figure(figsize=(12, 2.5 * num_items))
-        spec = gridspec.GridSpec(num_items, 1)
-        for i, (waveform, text) in enumerate(zip(batch_audio, batch_texts)):
-            ax = fig.add_subplot(spec[i])
-            ax.plot(waveform.numpy())
-            ax.set_xlim(0, len(waveform))
-            ax.set_ylabel(f"Item {i + 1}")
-            ax.set_xticks([])
-            ax.set_yticks([])
-            ax.set_title(text, fontsize=8, pad=2)
-        plt.tight_layout()
-        filename = f"plots/batch{epoch:04d}_segment{batch_id:05d}.pdf"
-        plt.savefig(filename)
-        plt.close()
-        self._vprint(f"Saved plot to {filename}")
+    def _plot_batch_waveforms(self, batch_audio_items, batch_texts_items, epoch, batch_id):
+        num_items = len(batch_audio_items)
+        counts = [len(seq) for seq in batch_audio_items]
+        if self.batch_segment_strategy == "clipping":
+            K = min(counts)
+        else:
+            K = max(counts)
+        for seg_idx in range(K):
+            fig = plt.figure(figsize=(12, 2.5 * num_items))
+            for i in range(num_items):
+                seq, texts = batch_audio_items[i], batch_texts_items[i]
+                if seg_idx < len(seq):
+                    wave, title = seq[seg_idx], texts[seg_idx]
+                else:
+                    wave = torch.zeros_like(batch_audio_items[i][0])
+                    title = ""
+                ax = fig.add_subplot(num_items, 1, i+1)
+                ax.plot(wave.numpy())
+                ax.set_xlim(0, len(wave))
+                ax.set_ylabel(f"Item {i+1}")
+                ax.set_xticks([]); ax.set_yticks([])
+                ax.set_title(title, fontsize=8, pad=2)
+            plt.tight_layout()
+            fname = f"plots/batch{epoch:04d}_batch{batch_id:05d}_segment{seg_idx:05d}.pdf"
+            plt.savefig(fname); plt.close(fig)
+            self._vprint(f"Saved plot to {fname}")
 
     def simulate_training_loop(self, steps=None, sleep=1.0, target_duration=30.0):
-            step = 0
-            sample_rate = 16000
-            target_samples = int(sample_rate * target_duration)
+        step = 0; sr = 16000; target = int(sr * target_duration)
+        while True:
+            try:
+                epoch, batch_id, batch = self.fetch_next_batch()
+            except RuntimeError as e:
+                print(f"[ERROR] Stopped training: {e}"); break
 
-            while True:
+            batch_audio_items, batch_texts_items, batch_masks_items = [], [], []
+            for itm in batch:
                 try:
-                    epoch, batch_id, batch = self.fetch_next_batch()
-                except RuntimeError as e:
-                    print(f"[ERROR] Stopped training: {e}")
-                    break
+                    audios, texts, masks = self._load_and_preprocess_batch_item(itm, target)
+                    batch_audio_items.append(audios)
+                    batch_texts_items.append(texts)
+                    batch_masks_items.append(masks)
+                    self._vprint(f"Loaded item → segments: {len(audios)}")
+                except Exception as e:
+                    self._vprint(f"[ERROR] Skipping item: {e}")
+            if not batch_audio_items:
+                self._vprint("[WARN] No valid items. Skipping batch...")
+                continue
 
-                batch_audio = []
-                batch_texts = []
-                batch_masks = []
-                for itm in batch:
-                    try:
-                        audios, texts, masks = self._load_and_preprocess_batch_item(itm, target_samples)
-                        self._vprint(f"Audio tensor shapes: {[tensor.shape for tensor in audios]}, Texts: {texts}")
-                        batch_audio.extend(audios)
-                        batch_texts.extend(texts)
-                        batch_masks.extend(masks)
-                    except Exception as e:
-                        self._vprint(f"[ERROR] Skipping item: {e}")
-                        continue
+            counts = [len(seq) for seq in batch_audio_items]
+            K = min(counts) if self.batch_segment_strategy=="clipping" else max(counts)
 
-                if not batch_audio:
-                    self._vprint("[WARN] No valid items in batch. Skipping…")
-                    continue
+            for seg_idx in range(K):
+                mini_audio, mini_mask = [], []
+                for i in range(len(batch_audio_items)):
+                    seq = batch_audio_items[i]
+                    mseq = batch_masks_items[i]
+                    if seg_idx < len(seq):
+                        mini_audio.append(seq[seg_idx])
+                        mini_mask.append(mseq[seg_idx])
+                    else:
+                        zeros = torch.zeros(target, dtype=torch.float32)
+                        mini_audio.append(zeros)
+                        mini_mask.append(torch.zeros(target, dtype=torch.bool))
+                batch_tensor = torch.stack(mini_audio)
+                mask_tensor  = torch.stack(mini_mask)
 
-                batch_tensor = torch.stack(batch_audio)         # (B, target_samples)
-                mask_tensor  = torch.stack(batch_masks)         # (B, target_samples)
+                if self.debug_spectrograms:
+                    self._plot_batch_waveforms(batch_audio_items, batch_texts_items, epoch, batch_id)
 
-                # … optionally debug-plot …
+                self._vprint(f"Simulated train: segment {seg_idx+1}/{K}, batch size {batch_tensor.shape}")
                 time.sleep(sleep)
-                self.mark_batch_done(epoch, batch_id)
-                self.log("INFO", f"Completed batch {batch_id} @ epoch {epoch}")
-                step += 1
-                if steps and step >= steps:
-                    break
 
-            self.end_session()
-            self._vprint("Training session ended.")
-    
+            self.mark_batch_done(epoch, batch_id)
+            self.log("INFO", f"Completed batch {batch_id} @ epoch {epoch}")
+            step += 1
+            if steps and step >= steps:
+                break
+
+        self.end_session()
+
+  
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Simulated training client for speech data server")
     parser.add_argument("--config", default="config.yaml", help="Path to config.yaml")
