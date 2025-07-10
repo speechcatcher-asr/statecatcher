@@ -13,7 +13,7 @@ def simulate_training_loop(ds, steps=None, sleep=1.0, target_duration=30.0):
     and optionally plotting each segment-slice.
     """
     step = 0
-    sr = 16000
+    sr = ds.batch_samplerate
     target_samples = int(sr * target_duration)
 
     while True:
@@ -116,6 +116,8 @@ def main():
                         help="Pause between segment-slices (seconds)")
     parser.add_argument("--target_duration", type=float, default=30.0,
                         help="Target segment length (seconds)")
+    parser.add_argument("--batch-samplerate", type=int, default=16000,
+                        help="Working sample rate for all audio resampling (Hz)")
     parser.add_argument("--verbose", action="store_true",
                         help="Enable verbose logging")
     parser.add_argument("--debug-spectrograms", action="store_true",
@@ -133,7 +135,8 @@ def main():
         config_path=args.config,
         verbose=args.verbose,
         debug_spectrograms=args.debug_spectrograms,
-        batch_segment_strategy=args.batch_segment_strategy
+        batch_segment_strategy=args.batch_segment_strategy,
+        batch_samplerate=args.batch_samplerate
     )
 
     ds.start_session(
@@ -153,3 +156,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
