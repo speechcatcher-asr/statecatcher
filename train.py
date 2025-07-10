@@ -24,6 +24,29 @@ except ImportError:
     HAVE_RNNT = False
 
 
+class RNNTPredictorJoiner(nn.Module):
+    """
+    Minimal RNN-T predictor+joiner:
+      - Embeds the label sequence (including blank prefix)
+      - Adds encoder and predictor embeddings
+      - Projects to vocab-size logits
+    """
+    def __init__(self, enc_dim: int, vocab_size: int):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, enc_dim)
+        self.joiner = nn.Linear(enc_dim, vocab_size)
+
+    def forward(self, enc_out: torch.Tensor, prefix: torch.Tensor):
+        # enc_out: (B, T, enc_dim)
+        # prefix:  (B, U, enc_dim) via embedding
+        pred_emb = self.embedding(prefix)               # (B, U, enc_dim)
+        # broadcast sum
+        joint = enc_out.unsqueeze(2) + pred_emb.unsqueeze(1)  # (B, T, U, enc_dim)
+        joint = torch.tanh(joint)
+        logits = self.joiner(joint)                     # (B, T, U, V)
+        return logits
+
+
 def detach_states(states):
     if states is None:
         return None
@@ -47,12 +70,12 @@ def train(args):
     logger.setLevel(logging.INFO)
     fh = logging.FileHandler(os.path.join(model_dir, "train.log"))
     fh.setLevel(logging.INFO)
-    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-    fh.setFormatter(formatter)
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    fh.setFormatter(fmt)
     logger.addHandler(fh)
     sh = logging.StreamHandler()
     sh.setLevel(logging.INFO)
-    sh.setFormatter(formatter)
+    sh.setFormatter(fmt)
     logger.addHandler(sh)
     logger.info(f"Model directory: {model_dir}")
 
@@ -73,7 +96,7 @@ def train(args):
         feats = frontend(dummy.unsqueeze(0))
         feat_dim = feats.shape[1]  # (B, F, T)
 
-    # build model
+    # build encoder model
     enc_cfg = {
         "hidden_size": args.hidden_size,
         "num_layers": args.num_layers,
@@ -98,20 +121,25 @@ def train(args):
     ).to(device)
     logger.info(f"Model built: {args.encoder}, feat_dim={feat_dim}, vocab_size={vocab_size}")
 
+    # optionally build RNNT predictor+joiner
+    if args.mode == "rnnt":
+        if not HAVE_RNNT:
+            logger.error("warp_rnnt not available, cannot train RNN-T")
+            return
+        joiner = RNNTPredictorJoiner(model.enc_out_dim, vocab_size).to(device)
+        logger.info("Initialized RNNT predictor+joiner")
+
     # loss
     if args.mode == "ctc":
         criterion = nn.CTCLoss(blank=blank_id, zero_infinity=True)
     else:
-        if not HAVE_RNNT:
-            logger.error("warp_rnnt not available, cannot train RNN-T")
-            return
         criterion = RNNTLoss(blank=blank_id)
     logger.info(f"Using loss: {args.mode}")
 
     # optimizer
     if args.optimizer == "adamw":
         optimizer = optim.AdamW(
-            model.parameters(),
+            list(model.parameters()) + ([joiner.parameters()] if args.mode=="rnnt" else []),
             lr=args.lr,
             weight_decay=args.weight_decay,
             betas=(args.beta1, args.beta2),
@@ -119,12 +147,15 @@ def train(args):
     elif args.optimizer == "lion":
         from lion_pytorch import Lion
         optimizer = Lion(
-            model.parameters(),
+            list(model.parameters()) + ([joiner.parameters()] if args.mode=="rnnt" else []),
             lr=args.lr,
             weight_decay=args.weight_decay,
         )
     else:
-        optimizer = optim.Adam(model.parameters(), lr=args.lr)
+        optimizer = optim.Adam(
+            list(model.parameters()) + ([joiner.parameters()] if args.mode=="rnnt" else []),
+            lr=args.lr,
+        )
     logger.info(f"Optimizer: {args.optimizer}, lr={args.lr}")
 
     # LR scheduling
@@ -161,27 +192,26 @@ def train(args):
         try:
             epoch, batch_id, batch = ds.fetch_next_batch()
         except RuntimeError as e:
-            logger.error(f"Data fetch error: {e}; stopping training.")
+            logger.error(f"Data fetch error: {e}; stopping.")
             break
 
-        # detect epoch boundary
+        # epoch boundary: save checkpoint
         if prev_epoch is None:
             prev_epoch = epoch
         elif epoch != prev_epoch:
-            # finished prev_epoch → save checkpoint
             ckpt = os.path.join(model_dir, f"model_epoch{prev_epoch+1}.pt")
-            torch.save(model.state_dict(), ckpt)
+            torch.save({
+                "model": model.state_dict(),
+                **({"joiner": joiner.state_dict()} if args.mode=="rnnt" else {})
+            }, ckpt)
             logger.info(f"Saved checkpoint: {ckpt}")
-            # stop after desired epochs
             if prev_epoch + 1 >= args.epochs:
                 break
             prev_epoch = epoch
-
-        # stop once server epoch exceeds configured
         if epoch >= args.epochs:
             break
 
-        # preprocess each item
+        # load & chunk
         items = []
         for itm in batch:
             auds, txts, masks = ds._load_and_preprocess_batch_item(
@@ -189,17 +219,13 @@ def train(args):
             )
             items.append((auds, txts, masks))
 
-        # align segments
         seg_counts = [len(aud) for aud, _, _ in items]
         K = min(seg_counts) if args.batch_segment_strategy == "clipping" else max(seg_counts)
+        state = None  # reset state at epoch start
 
-        # reset state at start of each epoch
-        if state is None:
-            state = None
-
-        # iterate segment-slices
         for seg_idx in range(K):
-            slice_audio, slice_masks, slice_texts = [], [], []
+            # build slice
+            slice_audio = []; slice_masks = []; slice_texts = []
             for auds, txts, masks in items:
                 if seg_idx < len(auds):
                     slice_audio.append(auds[seg_idx])
@@ -210,36 +236,55 @@ def train(args):
                     slice_masks.append(torch.zeros_like(masks[0]))
                     slice_texts.append("")
 
+            # to device
             batch_audio = torch.stack(slice_audio).to(device)
             batch_masks = torch.stack(slice_masks).to(device)
 
+            # features
             with torch.no_grad():
                 feats = frontend(batch_audio.unsqueeze(1))
-            feats = feats.transpose(1, 2).contiguous()
+            feats = feats.transpose(1, 2).contiguous()  # (B, T, F)
 
-            # tokenize
+            # tokenize & prepare labels
             token_ids = [sp.encode(s, out_type=int) for s in slice_texts]
-            tgt_lens = [len(t) for t in token_ids]
-            max_tgt = max(tgt_lens)
+            tgt_lens  = [len(t) for t in token_ids]
+            max_tgt   = max(tgt_lens, default=0)
             tokens = torch.full(
                 (len(token_ids), max_tgt),
                 blank_id, dtype=torch.long, device=device
             )
             for i, t in enumerate(token_ids):
-                tokens[i, : len(t)] = torch.tensor(t, device=device)
+                if t:
+                    tokens[i, :len(t)] = torch.tensor(t, device=device)
 
             # input lengths
             subsample = batch_masks.size(1) // feats.size(1)
             in_lens = (batch_masks.sum(dim=1) // subsample).long().tolist()
 
-            # forward & backward
+            # forward+loss
             with autocast():
-                logits, new_state = model(feats, state)
+                enc_out, new_state = model(feats, state)  # enc_out: (B, T, E)
                 if args.mode == "ctc":
-                    logp = logits.log_softmax(-1).transpose(0, 1)
+                    logp = enc_out.log_softmax(-1).transpose(0, 1)  # (T, B, V)
                     loss = criterion(logp, tokens, in_lens, tgt_lens)
                 else:
-                    loss = criterion(logits, tokens, in_lens, tgt_lens)
+                    # build RNNT prefixes: blank + labels
+                    prefix_len = max_tgt + 1
+                    prefix = torch.full(
+                        (len(token_ids), prefix_len),
+                        blank_id, dtype=torch.long, device=device
+                    )
+                    for i, t in enumerate(token_ids):
+                        prefix[i, 1:1+len(t)] = torch.tensor(t, device=device)
+
+                    joint_logits = joiner(enc_out, prefix)           # (B, T, U, V)
+                    logp = joint_logits.log_softmax(-1)
+                    loss = criterion(
+                        logp,
+                        tokens,           # labels shape should be (B, U-1)
+                        torch.tensor(in_lens, dtype=torch.int32, device=device),
+                        torch.tensor(tgt_lens, dtype=torch.int32, device=device)
+                    )
                 loss = loss / args.accumulation_steps
 
             scaler.scale(loss).backward()
@@ -263,7 +308,6 @@ def train(args):
 
         ds.mark_batch_done(epoch, batch_id)
         ds.log("INFO", f"Completed batch {batch_id} @ epoch {epoch}")
-
         if args.steps and global_step >= args.steps:
             break
 
