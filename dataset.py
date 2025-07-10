@@ -15,7 +15,7 @@ from pathlib import Path
 from parse_vtts import vtt_to_segments_with_text, parse_timestamp
 
 class SpeechDataset:
-    def __init__(self, config_path="config.yaml", verbose=False, debug_spectrograms=False, batch_segment_strategy="clipping"):
+    def __init__(self, config_path="config.yaml", verbose=False, debug_spectrograms=False, batch_segment_strategy="clipping", batch_samplerate=16000):
         with open(config_path, "r") as f:
             self.config = yaml.safe_load(f)
         self.api_key = self.config["secret_api_key"]
@@ -25,6 +25,7 @@ class SpeechDataset:
         self.verbose = verbose
         self.debug_spectrograms = debug_spectrograms
         self.batch_segment_strategy = batch_segment_strategy  # 'clipping' or 'padding'
+        self.batch_samplerate = batch_samplerate
 
         if self.debug_spectrograms:
             Path("plots").mkdir(parents=True, exist_ok=True)
@@ -122,7 +123,7 @@ class SpeechDataset:
         try:
             out, _ = (
                 ffmpeg.input("pipe:0")
-                .output("pipe:", format="wav", acodec="pcm_s16le", ac=1, ar="16000")
+                .output("pipe:", format="wav", acodec="pcm_s16le", ac=1, ar=self.batch_samplerate)
                 .run(input=audio_resp.content, capture_stdout=True, capture_stderr=True)
             )
         except ffmpeg.Error as e:
@@ -130,9 +131,9 @@ class SpeechDataset:
 
         wav_data, _ = sf.read(io.BytesIO(out), dtype="int16")
         audio_float = wav_data.astype(np.float32) / 32767.0
-        sr = 16000
-        total_duration = len(audio_float) / sr
-        window_sec = target_samples / sr
+        sr = self.batch_samplerate
+        total_duration = len(audio_float) / float(sr)
+        window_sec = target_samples / float(sr)
 
         # 2) Download & parse VTT
         try:
