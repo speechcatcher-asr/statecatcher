@@ -92,8 +92,10 @@ def train(args):
     # frontend & infer feature dim
     frontend = make_frontend(args.frontend, args.batch_samplerate).to(device)
     with torch.no_grad():
-        dummy = torch.zeros(1, int(args.target_duration * args.batch_samplerate))
-        feats = frontend(dummy.unsqueeze(0))
+        dummy = torch.zeros(1, int(args.target_duration * args.batch_samplerate),
+                              device=device)
+        # if your frontend expects a channel dimension, keep the unsqueeze:
+        feats  = frontend(dummy.unsqueeze(0))
         feat_dim = feats.shape[1]  # (B, F, T)
 
     # build encoder model
