@@ -16,6 +16,7 @@ def train_sentencepiece(args):
         f"--pad_piece={args.pad_piece} "
         f"--bos_piece={args.bos_piece} "
         f"--eos_piece={args.eos_piece} "
+        f"--user_defined_symbols={args.user_defined_symbols}"
     )
     # Train the model
     spm.SentencePieceTrainer.Train(spm_cmd)
@@ -46,6 +47,11 @@ def parse_args():
         "--model_type", type=str, choices=["unigram", "bpe", "char", "word"],
         default="unigram",
         help="Type of model: unigram, bpe, char, or word"
+    )
+    parser.add_argument(
+        "--user_defined_symbols", type=str,
+        default="0,1,2,3,4,5,6,7,8,9,.,?,!,:,;,-",
+        help="Comma-separated list of symbols to force include in the vocabulary"
     )
     parser.add_argument(
         "--unk_piece", type=str, default="<unk>",
