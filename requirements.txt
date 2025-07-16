@@ -6,3 +6,7 @@ torch
 numpy
 matplotlib
 sentencepiece
+ffmpeg-python
+soundfile
+mlstm_kernels
+xlstm
