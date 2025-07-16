@@ -1,5 +1,8 @@
+--extra-index-url https://download.pytorch.org/whl/cu128
+--trusted-host download.pytorch.org
 PyYAML
 requests
 torch
 numpy
 matplotlib
+sentencepiece
