@@ -16,7 +16,6 @@ def train_sentencepiece(args):
         f"--pad_piece={args.pad_piece} "
         f"--bos_piece={args.bos_piece} "
         f"--eos_piece={args.eos_piece} "
-        f"--mining_sentencepiece={args.min_frequency}"
     )
     # Train the model
     spm.SentencePieceTrainer.Train(spm_cmd)
@@ -47,10 +46,6 @@ def parse_args():
         "--model_type", type=str, choices=["unigram", "bpe", "char", "word"],
         default="unigram",
         help="Type of model: unigram, bpe, char, or word"
-    )
-    parser.add_argument(
-        "--min_frequency", type=int, default=5,
-        help="Minimum frequency for a token to be included in the vocabulary"
     )
     parser.add_argument(
         "--unk_piece", type=str, default="<unk>",
