@@ -212,32 +212,42 @@ def train(args):
         K = min(seg_counts) if args.batch_segment_strategy == "clipping" else max(seg_counts)
         state = None  # reset state at epoch start
 
+        # Initialize the states at the beginning of the batch
+        state_list = [None for _ in range(len(items))]
+
         for seg_idx in range(K):
-            # build slice
-            slice_audio = []; slice_masks = []; slice_texts = []
-            for auds, txts, masks in items:
+            slice_audio = []
+            slice_masks = []
+            slice_texts = []
+            current_states = []
+
+            for idx, (auds, txts, masks) in enumerate(items):
                 if seg_idx < len(auds):
                     slice_audio.append(auds[seg_idx])
                     slice_masks.append(masks[seg_idx])
                     slice_texts.append(txts[seg_idx])
+                    current_states.append(state_list[idx])  # carry forward previous state
                 else:
+                    # padding for missing segments
                     slice_audio.append(torch.zeros_like(auds[0]))
                     slice_masks.append(torch.zeros_like(masks[0]))
                     slice_texts.append("")
+                    current_states.append(None)  # reset state for padded segment
 
-            # to device
             batch_audio = torch.stack(slice_audio).to(device)
             batch_masks = torch.stack(slice_masks).to(device)
 
-            # features
             with torch.no_grad():
                 feats = frontend(batch_audio.unsqueeze(1))
             feats = feats.transpose(1, 2).contiguous()  # (B, T, F)
 
-            # tokenize & prepare labels
+            if args.debug:
+                print(f"[DEBUG] Segment idx: {seg_idx}")
+                print(f"[DEBUG] Feats shape: {tuple(feats.shape)}")
+
             token_ids = [sp.encode(s, out_type=int) for s in slice_texts]
-            tgt_lens  = [len(t) for t in token_ids]
-            max_tgt   = max(tgt_lens, default=0)
+            tgt_lens = [len(t) for t in token_ids]
+            max_tgt = max(tgt_lens, default=0)
             tokens = torch.full(
                 (len(token_ids), max_tgt),
                 blank_id, dtype=torch.long, device=device
@@ -246,46 +256,25 @@ def train(args):
                 if t:
                     tokens[i, :len(t)] = torch.tensor(t, device=device)
 
-            # input lengths
             subsample = batch_masks.size(1) // feats.size(1)
             in_lens = (batch_masks.sum(dim=1) // subsample).long().tolist()
 
-            # Debug prints
             if args.debug:
-                print(f"[DEBUG] Feats shape: {tuple(feats.shape)}")
                 print(f"[DEBUG] Tokens shape: {tuple(tokens.shape)}")
                 print(f"[DEBUG] Input lengths: {in_lens}")
                 print(f"[DEBUG] Target lengths: {tgt_lens}")
 
-            # forward+loss
             with autocast():
                 if args.debug:
                     print("[DEBUG] Starting forward pass")
-                enc_out, new_state = model(feats, state)  # enc_out: (B, T, E)
+
+                enc_out, new_states_batch = model(feats, current_states)
+
                 if args.debug:
                     print(f"[DEBUG] Encoder output shape: {tuple(enc_out.shape)}")
-                    print(f"[DEBUG] New state: {new_state}")
-                if args.mode == "ctc":
-                    logp = enc_out.log_softmax(-1).transpose(0, 1)  # (T, B, V)
-                    loss = criterion(logp, tokens, in_lens, tgt_lens)
-                else:
-                    # build RNNT prefixes: blank + labels
-                    prefix_len = max_tgt + 1
-                    prefix = torch.full(
-                        (len(token_ids), prefix_len),
-                        blank_id, dtype=torch.long, device=device
-                    )
-                    for i, t in enumerate(token_ids):
-                        prefix[i, 1:1+len(t)] = torch.tensor(t, device=device)
 
-                    joint_logits = joiner(enc_out, prefix)           # (B, T, U, V)
-                    logp = joint_logits.log_softmax(-1)
-                    loss = criterion(
-                        logp,
-                        tokens,           # labels shape should be (B, U-1)
-                        torch.tensor(in_lens, dtype=torch.int32, device=device),
-                        torch.tensor(tgt_lens, dtype=torch.int32, device=device)
-                    )
+                logp = enc_out.log_softmax(-1).transpose(0, 1)
+                loss = criterion(logp, tokens, in_lens, tgt_lens)
                 loss = loss / args.accumulation_steps
 
             scaler.scale(loss).backward()
@@ -298,7 +287,9 @@ def train(args):
                 optimizer.zero_grad()
                 scheduler.step()
 
-            state = detach_states(new_state)
+            for idx, new_state in enumerate(new_states_batch):
+                state_list[idx] = detach_states(new_state)
+
             global_step += 1
 
             if args.verbose:
@@ -306,6 +297,7 @@ def train(args):
 
             if args.steps and global_step >= args.steps:
                 break
+
 
         ds.mark_batch_done(epoch, batch_id)
         ds.log("INFO", f"Completed batch {batch_id} @ epoch {epoch}")
