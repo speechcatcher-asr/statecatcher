@@ -14,7 +14,7 @@ import torchaudio
 import sentencepiece as spm
 
 import dataset
-from model import make_frontend, ASRModel
+from model import make_frontend, ASRModel, build_encoder
 
 # Try to import RNN-T loss; if unavailable, only CTC will work
 try:
@@ -22,7 +22,6 @@ try:
     HAVE_RNNT = True
 except ImportError:
     HAVE_RNNT = False
-
 
 class RNNTPredictorJoiner(nn.Module):
     """
@@ -46,7 +45,6 @@ class RNNTPredictorJoiner(nn.Module):
         logits = self.joiner(joint)                     # (B, T, U, V)
         return logits
 
-
 def detach_states(states):
     if states is None:
         return None
@@ -54,7 +52,6 @@ def detach_states(states):
         return tuple(s.detach() for s in states)
     else:
         return states.detach()
-
 
 def train(args):
     # create model directory with timestamp
@@ -92,34 +89,24 @@ def train(args):
     # frontend & infer feature dim
     frontend = make_frontend(args.frontend, args.batch_samplerate).to(device)
     with torch.no_grad():
-        dummy = torch.zeros(1, int(args.target_duration * args.batch_samplerate),
-                              device=device)
-        # if your frontend expects a channel dimension, keep the unsqueeze:
-        feats  = frontend(dummy.unsqueeze(0))
-        feat_dim = feats.shape[1]  # (B, F, T)
+        # Dummy input should match training: (1,1,T)
+        dummy = torch.zeros(int(args.target_duration * args.batch_samplerate),
+                                 device=device)
+        dummy = dummy.unsqueeze(0).unsqueeze(1)
+        feats = frontend(dummy)
+        # Now feats is (1, C, T) or (1, F, T); transpose to (B, T, F)
+        feats = feats.transpose(1, 2).contiguous()
+        feat_dim = feats.shape[-1]
 
-    # build encoder model
-    enc_cfg = {
-        "hidden_size": args.hidden_size,
-        "num_layers": args.num_layers,
-        **({
-            "embedding_dim": args.embedding_dim,
-            "num_heads": args.num_heads,
-            "num_blocks": args.num_blocks,
-            "vocab_size": vocab_size,
-            "return_last_states": True,
-            "mode": "train",
-            "chunkwise_kernel": args.chunkwise_kernel,
-            "sequence_kernel": args.sequence_kernel,
-            "step_kernel": args.step_kernel,
-        } if args.encoder == "xlstm" else {})
-    }
+    # build encoder
+    encoder = build_encoder(args, vocab_size)
+    # assemble the ASR model
     model = ASRModel(
         frontend=frontend,
-        encoder_type=args.encoder,
-        encoder_cfg=enc_cfg,
+        encoder=encoder,
         vocab_size=vocab_size,
-        feat_dim=feat_dim
+        feat_dim=feat_dim,
+        debug=args.debug
     ).to(device)
     logger.info(f"Model built: {args.encoder}, feat_dim={feat_dim}, vocab_size={vocab_size}")
 
@@ -263,9 +250,21 @@ def train(args):
             subsample = batch_masks.size(1) // feats.size(1)
             in_lens = (batch_masks.sum(dim=1) // subsample).long().tolist()
 
+            # Debug prints
+            if args.debug:
+                print(f"[DEBUG] Feats shape: {tuple(feats.shape)}")
+                print(f"[DEBUG] Tokens shape: {tuple(tokens.shape)}")
+                print(f"[DEBUG] Input lengths: {in_lens}")
+                print(f"[DEBUG] Target lengths: {tgt_lens}")
+
             # forward+loss
             with autocast():
+                if args.debug:
+                    print("[DEBUG] Starting forward pass")
                 enc_out, new_state = model(feats, state)  # enc_out: (B, T, E)
+                if args.debug:
+                    print(f"[DEBUG] Encoder output shape: {tuple(enc_out.shape)}")
+                    print(f"[DEBUG] New state: {new_state}")
                 if args.mode == "ctc":
                     logp = enc_out.log_softmax(-1).transpose(0, 1)  # (T, B, V)
                     loss = criterion(logp, tokens, in_lens, tgt_lens)
@@ -316,7 +315,6 @@ def train(args):
     ds.end_session()
     logger.info("Training complete.")
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Real ASR training loop")
     parser.add_argument("--config", default="config.yaml")
@@ -364,6 +362,7 @@ if __name__ == "__main__":
                         default="native_sequence__triton")
     parser.add_argument("--step-kernel", type=str, default="triton")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--debug", action="store_true", help="Enable debug mode")
     args = parser.parse_args()
 
     train(args)
