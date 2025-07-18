@@ -1,4 +1,39 @@
 import torch.nn as nn
+import torchaudio
+from xlstm.xlstm_large.model import xLSTMLargeConfig
+
+def build_encoder(args, vocab_size):
+    if args.encoder == "lstm":
+        # standard PyTorch LSTM
+        # input_size=embedding_dim, hidden_size, num_layers, batch_first=True for (B,T,Feats)
+        return nn.LSTM(
+            input_size=args.embedding_dim,
+            hidden_size=args.hidden_size,
+            num_layers=args.num_layers,
+            batch_first=True,
+            bidirectional=False,     # or True if you want bi‐LSTM
+            dropout=0.0              # set dropout between layers if desired
+        )
+
+    elif args.encoder == "xlstm":
+        # xLSTM “large” variant
+        xlstm_cfg = {
+            "embedding_dim":           args.embedding_dim,
+            "num_heads":               args.num_heads,
+            "num_blocks":              args.num_blocks,
+            "vocab_size":              vocab_size,
+            "return_last_states":      True,
+            "mode":                    "train",
+            "chunkwise_kernel":        args.chunkwise_kernel,
+            "sequence_kernel":         args.sequence_kernel,
+            "step_kernel":             args.step_kernel,
+            # all other parameters will take their defaults
+        }
+        return xLSTMLargeConfig(**xlstm_cfg)
+
+    else:
+        raise ValueError(f"Unknown encoder type: {args.encoder!r}")
+
 
 def make_frontend(ftype: str, sample_rate: int):
     if ftype == "mfcc":
