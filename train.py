@@ -106,6 +106,7 @@ def train(args):
         encoder=encoder,
         vocab_size=vocab_size,
         feat_dim=feat_dim,
+        proj_dim=args.embedding_dim,
         debug=args.debug
     ).to(device)
     logger.info(f"Model built: {args.encoder}, feat_dim={feat_dim}, vocab_size={vocab_size}")

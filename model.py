@@ -53,7 +53,7 @@ def make_frontend(ftype: str, sample_rate: int):
          raise ValueError(f"Unsupported frontend: {ftype}")
 
 class ASRModel(nn.Module):
-     def __init__(self, frontend: nn.Module, encoder, vocab_size: int, feat_dim: int, debug: bool = True):
+    def __init__(self, frontend: nn.Module, encoder, vocab_size: int, feat_dim: int, proj_dim: int, debug: bool = True):
          super().__init__()
          self.frontend = frontend
          self.debug = debug
@@ -64,11 +64,12 @@ class ASRModel(nn.Module):
              hidden = encoder.hidden_size
              bidi = encoder.bidirectional
              self.enc_out_dim = hidden * (2 if bidi else 1)
+             #self.proj = nn.Linear(feat_dim, proj_dim)
 
          # xLSTM config: instantiate projector + xLSTMLarge
          elif isinstance(encoder, xLSTMLargeConfig):
              cfg = encoder
-             self.proj = nn.Linear(feat_dim, cfg.embedding_dim)
+             self.proj = nn.Linear(feat_dim, proj_dim)
              self.encoder = xLSTMLarge(cfg)
              self.enc_out_dim = cfg.embedding_dim
 
@@ -77,16 +78,16 @@ class ASRModel(nn.Module):
 
          self.classifier = nn.Linear(self.enc_out_dim, vocab_size)
 
-     def forward(self, feats, states=None):
+    def forward(self, feats, states=None):
          # Debug shapes before any change
          if self.debug:
              print(f"[DEBUG] Input feats shape: {tuple(feats.shape)}")
 
-         # feats may come as (B, F, T) or (B, T, F); ensure (B, T, F)
-         if feats.dim() == 3 and feats.size(1) > feats.size(2):
-             if self.debug:
-                 print(f"[DEBUG] Transposing feats from (B,F,T) to (B,T,F)")
-             feats = feats.transpose(1, 2).contiguous()
+         ## feats may come as (B, F, T) or (B, T, F); ensure (B, T, F)
+         #if feats.dim() == 3 and feats.size(1) > feats.size(2):
+         #    if self.debug:
+         #        print(f"[DEBUG] Transposing feats from (B,F,T) to (B,T,F)")
+         #    feats = feats.transpose(1, 2).contiguous()
 
          if self.debug:
              print(f"[DEBUG] Feats after transpose shape: {tuple(feats.shape)}")
