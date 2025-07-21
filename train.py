@@ -173,10 +173,12 @@ def train(args):
     )
 
     prev_epoch = None
-    state = None
     global_step = 0
-
     logger.info(f"Starting training for {args.epochs} epochs")
+
+    sr = ds.batch_samplerate
+    target_samples = int(sr * args.target_duration)
+
     while True:
         try:
             epoch, batch_id, batch = ds.fetch_next_batch()
@@ -184,80 +186,75 @@ def train(args):
             logger.error(f"Data fetch error: {e}; stopping.")
             break
 
-        # epoch boundary: save checkpoint
         if prev_epoch is None:
             prev_epoch = epoch
         elif epoch != prev_epoch:
             ckpt = os.path.join(model_dir, f"model_epoch{prev_epoch+1}.pt")
             torch.save({
                 "model": model.state_dict(),
-                **({"joiner": joiner.state_dict()} if args.mode=="rnnt" else {})
+                **({"joiner": joiner.state_dict()} if args.mode == "rnnt" else {})
             }, ckpt)
             logger.info(f"Saved checkpoint: {ckpt}")
             if prev_epoch + 1 >= args.epochs:
                 break
             prev_epoch = epoch
+
         if epoch >= args.epochs:
             break
 
-        # load & chunk
-        items = []
-        for itm in batch:
-            auds, txts, masks = ds._load_and_preprocess_batch_item(
-                itm, int(args.batch_samplerate * args.target_duration)
-            )
-            items.append((auds, txts, masks))
+        batch_audio_items, batch_texts_items, batch_masks_items = [], [], []
 
-        seg_counts = [len(aud) for aud, _, _ in items]
-        K = min(seg_counts) if args.batch_segment_strategy == "clipping" else max(seg_counts)
-        state = None  # reset state at epoch start
+        for item in batch:
+            audios, texts, masks = ds._load_and_preprocess_batch_item(item, target_samples)
+            batch_audio_items.append(audios)
+            batch_texts_items.append(texts)
+            batch_masks_items.append(masks)
 
-        # Initialize the states at the beginning of the batch
-        state_list = [None for _ in range(len(items))]
+        seg_counts = [len(segs) for segs in batch_audio_items]
+        if ds.batch_segment_strategy == "clipping":
+            K = min(seg_counts)
+        else:
+            K = max(seg_counts)
+
+        state_list = [None for _ in batch_audio_items]
 
         for seg_idx in range(K):
-            slice_audio = []
-            slice_masks = []
-            slice_texts = []
-            current_states = []
+            slice_audio, slice_masks, slice_texts, current_states = [], [], [], []
 
-            for idx, (auds, txts, masks) in enumerate(items):
-                if seg_idx < len(auds):
-                    slice_audio.append(auds[seg_idx])
+            for idx, (audios, texts, masks) in enumerate(zip(batch_audio_items, batch_texts_items, batch_masks_items)):
+                if seg_idx < len(audios):
+                    slice_audio.append(audios[seg_idx])
                     slice_masks.append(masks[seg_idx])
-                    slice_texts.append(txts[seg_idx])
-                    current_states.append(state_list[idx])  # carry forward previous state
+                    slice_texts.append(texts[seg_idx])
+                    current_states.append(state_list[idx])
                 else:
-                    # padding for missing segments
-                    slice_audio.append(torch.zeros_like(auds[0]))
-                    slice_masks.append(torch.zeros_like(masks[0]))
+                    slice_audio.append(torch.zeros(target_samples, dtype=torch.float32))
+                    slice_masks.append(torch.zeros(target_samples, dtype=torch.bool))
                     slice_texts.append("")
-                    current_states.append(None)  # reset state for padded segment
+                    current_states.append(None)
 
-            batch_audio = torch.stack(slice_audio).to(device)
-            batch_masks = torch.stack(slice_masks).to(device)
+            batch_tensor = torch.stack(slice_audio).to(device)
+            mask_tensor = torch.stack(slice_masks).to(device)
+            
+            if args.debug:
+                print(f"[DEBUG] Batch shape: {tuple(batch_tensor.shape)}")
+                print(f"[DEBUG] Mask shape: {tuple(mask_tensor.shape)}")
 
             with torch.no_grad():
-                feats = frontend(batch_audio.unsqueeze(1))
-            feats = feats.transpose(1, 2).contiguous()  # (B, T, F)
+                feats = frontend(batch_tensor)
+            feats = feats.transpose(1, 2).contiguous()
 
-            if args.debug:
-                print(f"[DEBUG] Segment idx: {seg_idx}")
-                print(f"[DEBUG] Feats shape: {tuple(feats.shape)}")
-
-            token_ids = [sp.encode(s, out_type=int) for s in slice_texts]
+            token_ids = [sp.encode(txt, out_type=int) for txt in slice_texts]
             tgt_lens = [len(t) for t in token_ids]
-            max_tgt = max(tgt_lens, default=0)
-            tokens = torch.full(
-                (len(token_ids), max_tgt),
-                blank_id, dtype=torch.long, device=device
-            )
+            max_tgt_len = max(tgt_lens)
+
+            tokens = torch.full((len(token_ids), max_tgt_len), blank_id, dtype=torch.long, device=device)
             for i, t in enumerate(token_ids):
                 if t:
                     tokens[i, :len(t)] = torch.tensor(t, device=device)
 
-            subsample = batch_masks.size(1) // feats.size(1)
-            in_lens = (batch_masks.sum(dim=1) // subsample).long().tolist()
+            subsample = mask_tensor.size(1) // feats.size(1)
+            in_lens = (mask_tensor.sum(dim=1) // subsample).long().tolist()
 
             if args.debug:
                 print(f"[DEBUG] Tokens shape: {tuple(tokens.shape)}")
@@ -265,13 +262,7 @@ def train(args):
                 print(f"[DEBUG] Target lengths: {tgt_lens}")
 
             with autocast():
-                if args.debug:
-                    print("[DEBUG] Starting forward pass")
-
                 enc_out, new_states_batch = model(feats, current_states)
-
-                if args.debug:
-                    print(f"[DEBUG] Encoder output shape: {tuple(enc_out.shape)}")
 
                 logp = enc_out.log_softmax(-1).transpose(0, 1)
                 loss = criterion(logp, tokens, in_lens, tgt_lens)
@@ -287,20 +278,18 @@ def train(args):
                 optimizer.zero_grad()
                 scheduler.step()
 
-            for idx, new_state in enumerate(new_states_batch):
-                state_list[idx] = detach_states(new_state)
+            state_list = [detach_states(s) for s in new_states_batch]
 
             global_step += 1
-
             if args.verbose:
                 logger.info(f"[Step {global_step}] Loss: {loss.item():.4f}")
 
             if args.steps and global_step >= args.steps:
                 break
 
-
         ds.mark_batch_done(epoch, batch_id)
         ds.log("INFO", f"Completed batch {batch_id} @ epoch {epoch}")
+
         if args.steps and global_step >= args.steps:
             break
 
