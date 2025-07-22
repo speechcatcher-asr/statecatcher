@@ -293,7 +293,7 @@ def train(args):
             encoder_state = detach_states(output_state)
 
             global_step += 1
-            if args.verbose:
+            if args.verbose or args.debug:
                 logger.info(f"[Step {global_step}] Loss: {loss.item():.4f}")
 
             if args.steps and global_step >= args.steps:

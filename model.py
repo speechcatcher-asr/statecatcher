@@ -2,11 +2,11 @@ import torch.nn as nn
 import torchaudio
 from xlstm.xlstm_large.model import xLSTMLargeConfig, xLSTMLarge
 
-def build_encoder(args, vocab_size):
+def build_encoder(args, vocab_size, feat_dim=80):
      if args.encoder == "lstm":
          # standard PyTorch LSTM
          return nn.LSTM(
-             input_size=args.embedding_dim,
+             input_size=args.embedding_dim if args.embedding_dim != -1 else feat_dim,
              hidden_size=args.hidden_size,
              num_layers=args.num_layers,
              batch_first=True,
@@ -64,7 +64,8 @@ class ASRModel(nn.Module):
              hidden = encoder.hidden_size
              bidi = encoder.bidirectional
              self.enc_out_dim = hidden * (2 if bidi else 1)
-             self.proj = nn.Linear(feat_dim, proj_dim)
+             if proj_dim > 0:
+                self.proj = nn.Linear(feat_dim, proj_dim)
 
          # xLSTM config: instantiate projector + xLSTMLarge
          elif isinstance(encoder, xLSTMLargeConfig):
@@ -82,7 +83,8 @@ class ASRModel(nn.Module):
          # Debug shapes before any change
          if self.debug:
              print(f"[DEBUG] Input feats shape: {tuple(feats.shape)}")
-             print(f"[DEBUG] Input states:", states)
+             if states is None:
+                print(f"[DEBUG] states is None - initializing encoder with a new state.")
 
          ## feats may come as (B, F, T) or (B, T, F); ensure (B, T, F)
          #if feats.dim() == 3 and feats.size(1) > feats.size(2):
