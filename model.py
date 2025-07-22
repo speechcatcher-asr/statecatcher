@@ -64,7 +64,7 @@ class ASRModel(nn.Module):
              hidden = encoder.hidden_size
              bidi = encoder.bidirectional
              self.enc_out_dim = hidden * (2 if bidi else 1)
-             #self.proj = nn.Linear(feat_dim, proj_dim)
+             self.proj = nn.Linear(feat_dim, proj_dim)
 
          # xLSTM config: instantiate projector + xLSTMLarge
          elif isinstance(encoder, xLSTMLargeConfig):
@@ -82,6 +82,7 @@ class ASRModel(nn.Module):
          # Debug shapes before any change
          if self.debug:
              print(f"[DEBUG] Input feats shape: {tuple(feats.shape)}")
+             print(f"[DEBUG] Input states:", states)
 
          ## feats may come as (B, F, T) or (B, T, F); ensure (B, T, F)
          #if feats.dim() == 3 and feats.size(1) > feats.size(2):
@@ -92,18 +93,26 @@ class ASRModel(nn.Module):
          if self.debug:
              print(f"[DEBUG] Feats after transpose shape: {tuple(feats.shape)}")
 
-         # apply encoder
+         # apply input projection
          if hasattr(self, 'proj'):
              if self.debug:
                  print(f"[DEBUG] Projecting feats from dim {feats.size(-1)} to {self.proj.out_features}")
-             x = self.proj(feats)
+             feats = self.proj(feats)
              if self.debug:
-                 print(f"[DEBUG] After proj shape: {tuple(x.shape)}")
-             logits, new_states = self.encoder(x, states)
+                 print(f"[DEBUG] After proj shape: {tuple(feats.shape)}")
          else:
              if self.debug:
                  print(f"[DEBUG] Passing feats into LSTM with input dim {feats.size(-1)}")
+
+         # run encoder, with or without states
+         if states is not None:
+             if self.debug:
+                 print(f"[DEBUG] Run encoder with states:", states)
              logits, new_states = self.encoder(feats, states)
+         else:
+             if self.debug:
+                 print(f"[DEBUG] Run encoder with new state.")
+             logits, new_states = self.encoder(feats)
 
          if self.debug:
              print(f"[DEBUG] Encoder output logits shape: {tuple(logits.shape)}")

@@ -180,6 +180,13 @@ def train(args):
     sr = ds.batch_samplerate
     target_samples = int(sr * args.target_duration)
 
+    prev_epoch = None
+    global_step = 0
+    logger.info(f"Starting training for {args.epochs} epochs")
+
+    sr = ds.batch_samplerate
+    target_samples = int(sr * args.target_duration)
+
     while True:
         try:
             epoch, batch_id, batch = ds.fetch_next_batch()
@@ -212,31 +219,27 @@ def train(args):
             batch_masks_items.append(masks)
 
         seg_counts = [len(segs) for segs in batch_audio_items]
-        if ds.batch_segment_strategy == "clipping":
-            K = min(seg_counts)
-        else:
-            K = max(seg_counts)
+        K = min(seg_counts) if ds.batch_segment_strategy == "clipping" else max(seg_counts)
 
-        state_list = [None for _ in batch_audio_items]
+        # Clean state handling: single encoder_state, type depends on encoder
+        encoder_state = None
 
         for seg_idx in range(K):
-            slice_audio, slice_masks, slice_texts, current_states = [], [], [], []
+            slice_audio, slice_masks, slice_texts = [], [], []
 
             for idx, (audios, texts, masks) in enumerate(zip(batch_audio_items, batch_texts_items, batch_masks_items)):
                 if seg_idx < len(audios):
                     slice_audio.append(audios[seg_idx])
                     slice_masks.append(masks[seg_idx])
                     slice_texts.append(texts[seg_idx])
-                    current_states.append(state_list[idx])
                 else:
                     slice_audio.append(torch.zeros(target_samples, dtype=torch.float32))
                     slice_masks.append(torch.zeros(target_samples, dtype=torch.bool))
                     slice_texts.append("")
-                    current_states.append(None)
 
             batch_tensor = torch.stack(slice_audio).to(device)
             mask_tensor = torch.stack(slice_masks).to(device)
-            
+
             if args.debug:
                 print(f"[DEBUG] Batch shape: {tuple(batch_tensor.shape)}")
                 print(f"[DEBUG] Mask shape: {tuple(mask_tensor.shape)}")
@@ -262,8 +265,15 @@ def train(args):
                 print(f"[DEBUG] Input lengths: {in_lens}")
                 print(f"[DEBUG] Target lengths: {tgt_lens}")
 
+            # Prepare input state for model
+            if args.encoder == "lstm" and encoder_state is not None:
+                # already in (h, c) form — use as is
+                input_state = encoder_state
+            else:
+                input_state = encoder_state  # None or list (xLSTM)
+
             with autocast():
-                enc_out, new_states_batch = model(feats, current_states)
+                enc_out, output_state = model(feats, input_state)
 
                 logp = enc_out.log_softmax(-1).transpose(0, 1)
                 loss = criterion(logp, tokens, in_lens, tgt_lens)
@@ -279,7 +289,8 @@ def train(args):
                 optimizer.zero_grad()
                 scheduler.step()
 
-            state_list = [detach_states(s) for s in new_states_batch]
+            # Save detached states for next segment
+            encoder_state = detach_states(output_state)
 
             global_step += 1
             if args.verbose:
@@ -296,6 +307,7 @@ def train(args):
 
     ds.end_session()
     logger.info("Training complete.")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Real ASR training loop")
@@ -335,7 +347,7 @@ if __name__ == "__main__":
     parser.add_argument("--max-grad-norm", type=float, default=5.0)
     parser.add_argument("--hidden-size", type=int, default=512)
     parser.add_argument("--num-layers", type=int, default=3)
-    parser.add_argument("--embedding-dim", type=int, default=512)
+    parser.add_argument("--embedding-dim", type=int, default=128)
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--num-blocks", type=int, default=6)
     parser.add_argument("--chunkwise-kernel", type=str,
