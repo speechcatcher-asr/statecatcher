@@ -109,11 +109,11 @@ class ASRModel(nn.Module):
          # run encoder, with or without states
          if states is not None:
              if self.debug:
-                 print(f"[DEBUG] Run encoder with states:", states)
+                 print(f"[DEBUG] Run encoder with a previous state (stateful training).")
              logits, new_states = self.encoder(feats, states)
          else:
              if self.debug:
-                 print(f"[DEBUG] Run encoder with new state.")
+                 print(f"[DEBUG] Run encoder with a new state.")
              logits, new_states = self.encoder(feats)
 
          if self.debug:
