@@ -258,9 +258,12 @@ def train(args):
                     tokens[i, :len(t)] = torch.tensor(t, device=device)
 
             subsample = mask_tensor.size(1) // feats.size(1)
-            in_lens = (mask_tensor.sum(dim=1) // subsample).long().tolist()
+            in_lens = (mask_tensor.sum(dim=1) // subsample)
+            # clamping to max length
+            in_lens = in_lens.clamp(max=feats.size(1)).long().tolist()
 
             if args.debug:
+                print(f"[DEBUG] Output {subsample=} and {in_lens=}")
                 print(f"[DEBUG] Tokens shape: {tuple(tokens.shape)}")
                 print(f"[DEBUG] Input lengths: {in_lens}")
                 print(f"[DEBUG] Target lengths: {tgt_lens}")
