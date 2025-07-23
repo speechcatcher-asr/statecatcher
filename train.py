@@ -213,10 +213,20 @@ def train(args):
         batch_audio_items, batch_texts_items, batch_masks_items = [], [], []
 
         for item in batch:
-            audios, texts, masks = ds._load_and_preprocess_batch_item(item, target_samples)
+            try:
+                audios, texts, masks = ds._load_and_preprocess_batch_item(item, target_samples)
+            except Exception as e:
+                logger.error(f"Data preprocess error: {e}; trying to leave out batch item!.")
+                continue
+
             batch_audio_items.append(audios)
             batch_texts_items.append(texts)
             batch_masks_items.append(masks)
+
+        if not batch_audio_items:
+            logger.error(f"Batch is empty, probably due to previous errors. Retrying with a new batch after one second.")
+            time.sleep(1)
+            continue
 
         seg_counts = [len(segs) for segs in batch_audio_items]
         K = min(seg_counts) if ds.batch_segment_strategy == "clipping" else max(seg_counts)
