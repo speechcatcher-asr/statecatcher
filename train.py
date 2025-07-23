@@ -181,6 +181,7 @@ def train(args):
     sr = ds.batch_samplerate
     target_samples = int(sr * args.target_duration)
 
+    losses = [] # for running avg over the previous loss values
     prev_epoch = None
     global_step = 0
     logger.info(f"Starting training for {args.epochs} epochs")
@@ -191,9 +192,10 @@ def train(args):
     while True:
         try:
             epoch, batch_id, batch = ds.fetch_next_batch()
-        except RuntimeError as e:
-            logger.error(f"Data fetch error: {e}; stopping.")
-            break
+        except Exception as e:
+            logger.error(f"Data fetch error in fetch_next_batch(): {e}; sleeping for 10 seconds before retrying!")
+            time.sleep(10)
+            continue
 
         if prev_epoch is None:
             prev_epoch = epoch
@@ -308,12 +310,21 @@ def train(args):
 
             global_step += 1
             if args.verbose or args.debug:
-                logger.info(f"[Step {global_step}] Loss: {loss.item():.4f}")
+                losses += [float(loss.item())]
+                if len(losses) >= 10:
+                    avg_loss = sum(losses) / len(losses)
+                    logger.info(f"[Step {global_step}] Loss: {avg_loss:.4f}")
+                    losses = []
 
             if args.steps and global_step >= args.steps:
                 break
 
-        ds.mark_batch_done(epoch, batch_id)
+        try:
+            ds.mark_batch_done(epoch, batch_id)
+        except Exception as e:
+            logger.error(f"Problem with marking batch done: {e}; probably due to previous errors. Trying to fetch next batch.")
+            continue
+
         ds.log("INFO", f"Completed batch {batch_id} @ epoch {epoch}")
 
         if args.steps and global_step >= args.steps:
