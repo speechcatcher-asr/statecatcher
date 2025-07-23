@@ -118,7 +118,6 @@ class ASRModel(nn.Module):
 
          if self.debug:
              print(f"[DEBUG] Encoder output logits shape: {tuple(logits.shape)}")
-             print(f"[DEBUG] Encoder new_states: {new_states}")
 
          # map to vocabulary
          logits = self.classifier(logits)
