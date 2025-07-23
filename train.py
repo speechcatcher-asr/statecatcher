@@ -9,7 +9,7 @@ import logging
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 import torchaudio
 import sentencepiece as spm
 
@@ -76,8 +76,9 @@ def train(args):
     logger.addHandler(sh)
     logger.info(f"Model directory: {model_dir}")
 
-    # device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # device selection
+    device_str = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch.device(device_str)
     logger.info(f"Using device: {device}")
 
     # SentencePiece tokenizer
@@ -285,7 +286,7 @@ def train(args):
             else:
                 input_state = encoder_state  # None or list (xLSTM)
 
-            with autocast():
+            with autocast(device_type=device_str, dtype=torch.float16):
                 enc_out, output_state = model(feats, input_state)
 
                 logp = enc_out.log_softmax(-1).transpose(0, 1)
@@ -359,7 +360,7 @@ if __name__ == "__main__":
     parser.add_argument("--accumulation-steps", type=int, default=4)
     parser.add_argument("--max-grad-norm", type=float, default=5.0)
     parser.add_argument("--hidden-size", type=int, default=512)
-    parser.add_argument("--num-layers", type=int, default=3)
+    parser.add_argument("--num-layers", type=int, default=4)
     parser.add_argument("--embedding-dim", type=int, default=128)
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--num-blocks", type=int, default=6)
