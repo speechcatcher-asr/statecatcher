@@ -21,6 +21,12 @@ try:
 except ImportError:
     HAVE_RNNT = False
 
+try:
+    import aim
+    HAVE_AIM = True
+except ImportError:
+    HAVE_AIM = False
+
 class RNNTPredictorJoiner(nn.Module):
     """
     Minimal RNN-T predictor+joiner:
@@ -210,10 +216,16 @@ def prepare_tokens_and_lengths(slice_texts, sp, blank_id, device):
 
 def train(args):
     """Main training function."""
+    if HAVE_AIM:
+        run = aim.Run(experiment="asr_training")
+    else:
+        run = None
+
     # Setup model directory and logging
     model_dir = setup_model_directory(args)
     logger = setup_logging(model_dir)
     logger.info(f"Model directory: {model_dir}")
+    logger.info("Aim logging enabled." if HAVE_AIM else "Aim not available. Skipping experiment logging.")
 
     # Setup device for training
     device, device_str = setup_device()
@@ -234,6 +246,22 @@ def train(args):
     # Build and initialize the model
     model = build_model(args, device, feat_dim, vocab_size)
     logger.info(f"Model built: {args.encoder}, feat_dim={feat_dim}, vocab_size={vocab_size}")
+
+    if HAVE_AIM:
+        run["hparams"] = {
+            "encoder": args.encoder,
+            "frontend": args.frontend,
+            "mode": args.mode,
+            "lr": args.lr,
+            "batch_samplerate": args.batch_samplerate,
+            "target_duration": args.target_duration,
+            "optimizer": args.optimizer,
+            "max_grad_norm": args.max_grad_norm,
+            "epochs": args.epochs,
+            "accumulation_steps": args.accumulation_steps
+        }
+        run["model/num_params"] = sum(p.numel() for p in model.parameters())
+        run["tags"] = ['rnnt'] if args.mode == 'rnnt' else ['ctc']
 
     # Optionally build RNNT predictor+joiner
     joiner = None
@@ -309,7 +337,9 @@ def train(args):
 
         encoder_state = None
         for seg_idx in range(K):
-            batch_tensor, mask_tensor, slice_texts = prepare_batch_data(batch_audio_items, batch_texts_items, batch_masks_items, seg_idx, target_samples, device)
+            batch_tensor, mask_tensor, slice_texts = prepare_batch_data(
+                batch_audio_items, batch_texts_items, batch_masks_items, seg_idx, target_samples, device
+            )
 
             debug_print(args.debug, f"Batch shape: {tuple(batch_tensor.shape)}")
             debug_print(args.debug, f"Mask shape: {tuple(mask_tensor.shape)}")
@@ -340,9 +370,20 @@ def train(args):
 
             scaler.scale(loss).backward()
 
+            if HAVE_AIM:
+                run.track(loss.item(), name="loss", step=global_step)
+
             if (global_step + 1) % args.accumulation_steps == 0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+
+                if HAVE_AIM:
+                    grad_norm = 0.0
+                    for p in model.parameters():
+                        if p.grad is not None:
+                            grad_norm += p.grad.data.norm(2).item() ** 2
+                    run.track(grad_norm ** 0.5, name="grad_norm", step=global_step)
+
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
@@ -355,6 +396,8 @@ def train(args):
                 losses.append(float(loss.item()))
                 if len(losses) >= 10:
                     avg_loss = sum(losses) / len(losses)
+                    if HAVE_AIM:
+                        run.track(avg_loss, name="avg_loss_10", step=global_step)
                     logger.info(f"[Step {global_step}] Loss: {avg_loss:.4f}")
                     losses = []
 
