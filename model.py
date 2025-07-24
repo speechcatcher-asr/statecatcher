@@ -1,4 +1,5 @@
 import torch.nn as nn
+import torch.nn.functional as F
 import torchaudio
 from xlstm.xlstm_large.model import xLSTMLargeConfig, xLSTMLarge
 
@@ -17,7 +18,8 @@ def build_encoder(args, vocab_size, feat_dim=80):
      elif args.encoder == "xlstm":
          # return the xLSTM config; instantiation happens in ASRModel
          cfg = xLSTMLargeConfig(
-             embedding_dim=args.embedding_dim,
+             embedding_dim=feat_dim,
+             input_dim=feat_dim,
              num_heads=args.num_heads,
              num_blocks=args.num_blocks,
              vocab_size=vocab_size,
@@ -26,6 +28,7 @@ def build_encoder(args, vocab_size, feat_dim=80):
              chunkwise_kernel=args.chunkwise_kernel,
              sequence_kernel=args.sequence_kernel,
              step_kernel=args.step_kernel,
+             autocast_kernel_dtype="float16",
          )
          return cfg
 
@@ -70,9 +73,11 @@ class ASRModel(nn.Module):
          # xLSTM config: instantiate projector + xLSTMLarge
          elif isinstance(encoder, xLSTMLargeConfig):
              cfg = encoder
-             self.proj = nn.Linear(feat_dim, proj_dim)
              self.encoder = xLSTMLarge(cfg)
-             self.enc_out_dim = cfg.embedding_dim
+             self.enc_out_dim = 128
+             self.input_seq_pad_factor = 64
+             if proj_dim > 0:
+                self.proj = nn.Linear(feat_dim, proj_dim)
 
          else:
              raise ValueError(f"Unknown encoder provided: {type(encoder)}")
@@ -105,6 +110,16 @@ class ASRModel(nn.Module):
          else:
              if self.debug:
                  print(f"[DEBUG] Passing feats into LSTM with input dim {feats.size(-1)}")
+
+         # pad input sequence length if using xLSTM and sequence not divisible by 16 ---
+         if isinstance(self.encoder, xLSTMLarge):
+             seq_len = feats.size(1)
+             remainder = seq_len % self.input_seq_pad_factor
+             if remainder != 0:
+                 pad_len = self.input_seq_pad_factor - remainder
+                 if self.debug:
+                     print(f"[DEBUG] Padding sequence length from {seq_len} to {seq_len + pad_len}")
+                 feats = F.pad(feats, (0, 0, 0, pad_len))  # Pad time dimension (dim=1)
 
          # run encoder, with or without states
          if states is not None:
