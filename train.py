@@ -14,6 +14,8 @@ import sentencepiece as spm
 import dataset
 from model import make_frontend, ASRModel, build_encoder
 
+#torch.autograd.set_detect_anomaly(True)
+
 # Try to import RNN-T loss; if unavailable, only CTC will work
 try:
     from warp_rnnt import RNNTLoss
@@ -50,12 +52,29 @@ class RNNTPredictorJoiner(nn.Module):
         return logits
 
 def detach_states(states):
+    """Recursively detach all tensors in nested state structures (dicts, tuples, lists)."""
+    if states is None:
+        return None
+    elif isinstance(states, torch.Tensor):
+        return states.detach()
+    elif isinstance(states, dict):
+        return {k: detach_states(v) for k, v in states.items()}
+    elif isinstance(states, (list, tuple)):
+        return type(states)(detach_states(s) for s in states)
+    else:
+        # Catch any unexpected data type (e.g., numbers, strings)
+        return states
+
+def detach_states_old(states):
     """Detach states from the computation graph to prevent backpropagation through them."""
     if states is None:
         return None
     if isinstance(states, tuple):
         return tuple(s.detach() for s in states)
+    elif isinstance(states, dict):
+        return {k: detach_states(v) for k, v in states.items()}
     else:
+        print(states)
         return states.detach()
 
 def debug_print(debug, *args):
@@ -233,6 +252,8 @@ def train(args):
 
     # Load SentencePiece model
     sp, vocab_size, blank_id = load_sentencepiece_model(args)
+
+    logger.info(f"Vocab size (output tokens): {vocab_size}")
 
     # Build frontend and infer feature dimension
     frontend = make_frontend(args.frontend, args.batch_samplerate).to(device)
@@ -448,11 +469,15 @@ if __name__ == "__main__":
     parser.add_argument("--hidden-size", type=int, default=512)
     parser.add_argument("--num-layers", type=int, default=4)
     parser.add_argument("--embedding-dim", type=int, default=128)
-    parser.add_argument("--num-heads", type=int, default=4)
-    parser.add_argument("--num-blocks", type=int, default=6)
-    parser.add_argument("--chunkwise-kernel", type=str, default="chunkwise--triton_xl_chunk")
-    parser.add_argument("--sequence-kernel", type=str, default="native_sequence__triton")
-    parser.add_argument("--step-kernel", type=str, default="triton")
+    parser.add_argument("--num-heads", type=int, default=2)
+    parser.add_argument("--num-blocks", type=int, default=3)
+    parser.add_argument("--chunkwise-kernel", type=str, default="chunkwise--native_autograd")
+    parser.add_argument("--sequence-kernel", type=str, default="native_sequence__native")
+    parser.add_argument("--step-kernel", type=str, default="native")
+    # with triton:
+    #parser.add_argument("--chunkwise-kernel", type=str, default="chunkwise--triton_xl_chunk")
+    #parser.add_argument("--sequence-kernel", type=str, default="native_sequence__triton")
+    #parser.add_argument("--step-kernel", type=str, default="triton")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode")
 

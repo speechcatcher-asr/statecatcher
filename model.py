@@ -67,6 +67,7 @@ class ASRModel(nn.Module):
              hidden = encoder.hidden_size
              bidi = encoder.bidirectional
              self.enc_out_dim = hidden * (2 if bidi else 1)
+             self.classifier = nn.Linear(self.enc_out_dim, vocab_size)
              if proj_dim > 0:
                 self.proj = nn.Linear(feat_dim, proj_dim)
 
@@ -74,7 +75,7 @@ class ASRModel(nn.Module):
          elif isinstance(encoder, xLSTMLargeConfig):
              cfg = encoder
              self.encoder = xLSTMLarge(cfg)
-             self.enc_out_dim = 128
+             self.enc_out_dim = vocab_size
              self.input_seq_pad_factor = 64
              if proj_dim > 0:
                 self.proj = nn.Linear(feat_dim, proj_dim)
@@ -82,7 +83,6 @@ class ASRModel(nn.Module):
          else:
              raise ValueError(f"Unknown encoder provided: {type(encoder)}")
 
-         self.classifier = nn.Linear(self.enc_out_dim, vocab_size)
 
     def forward(self, feats, states=None):
          # Debug shapes before any change
@@ -134,10 +134,11 @@ class ASRModel(nn.Module):
          if self.debug:
              print(f"[DEBUG] Encoder output logits shape: {tuple(logits.shape)}")
 
-         # map to vocabulary
-         logits = self.classifier(logits)
-         if self.debug:
-             print(f"[DEBUG] After classifier shape: {tuple(logits.shape)}")
+         if hasattr(self, 'classifier'):
+             # map to vocabulary for LSTM
+             logits = self.classifier(logits)
+             if self.debug:
+                 print(f"[DEBUG] After classifier shape: {tuple(logits.shape)}")
 
          return logits, new_states
 
