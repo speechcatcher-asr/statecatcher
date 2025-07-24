@@ -5,14 +5,12 @@ import shutil
 import time
 import math
 import logging
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.amp import autocast, GradScaler
 import torchaudio
 import sentencepiece as spm
-
 import dataset
 from model import make_frontend, ASRModel, build_encoder
 
@@ -46,6 +44,7 @@ class RNNTPredictorJoiner(nn.Module):
         return logits
 
 def detach_states(states):
+    """Detach states from the computation graph to prevent backpropagation through them."""
     if states is None:
         return None
     if isinstance(states, tuple):
@@ -53,16 +52,21 @@ def detach_states(states):
     else:
         return states.detach()
 
-def train(args):
-    # create model directory with timestamp
+def debug_print(debug, *args):
+    """Helper function to print debug messages."""
+    if debug:
+        print("[DEBUG]", *args)
+
+def setup_model_directory(args):
+    """Create a directory for saving model checkpoints and logs."""
     timestamp = str(int(time.time()))
     model_dir = os.path.join("models", timestamp)
     os.makedirs(model_dir, exist_ok=True)
-
-    # copy config
     shutil.copy(args.config, os.path.join(model_dir, "config.yaml"))
+    return model_dir
 
-    # set up logging to file and stdout
+def setup_logging(model_dir):
+    """Configure logging to file and console."""
     logger = logging.getLogger("train")
     logger.setLevel(logging.INFO)
     fh = logging.FileHandler(os.path.join(model_dir, "train.log"))
@@ -74,63 +78,44 @@ def train(args):
     sh.setLevel(logging.INFO)
     sh.setFormatter(fmt)
     logger.addHandler(sh)
-    logger.info(f"Model directory: {model_dir}")
+    return logger
 
-    # device selection
+def setup_device():
+    """Determine and set the device for training (GPU or CPU)."""
     device_str = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device_str)
-    logger.info(f"Using device: {device}")
+    return device, device_str
 
-    # SentencePiece tokenizer
+def load_sentencepiece_model(args):
+    """Load the SentencePiece model for tokenization."""
     sp = spm.SentencePieceProcessor()
     sp.load(args.sp_model)
     vocab_size = sp.get_piece_size()
     blank_id = 0
+    return sp, vocab_size, blank_id
 
-    # frontend & infer feature dim
-    frontend = make_frontend(args.frontend, args.batch_samplerate).to(device)
-    with torch.no_grad():
-        # Dummy input should match training: (1,1,T)
-        dummy = torch.zeros(int(args.target_duration * args.batch_samplerate),
-                                 device=device)
-        dummy = dummy.unsqueeze(0).unsqueeze(1)
-        feats = frontend(dummy)
-        # Now feats is (1, C, T) or (1, F, T); transpose to (B, T, F)
-        feats = feats.transpose(1, 2).contiguous()
-        feat_dim = feats.shape[-1]
-
-    # build encoder
+def build_model(args, device, feat_dim, vocab_size):
+    """Build and initialize the ASR model."""
     encoder = build_encoder(args, vocab_size)
-    # assemble the ASR model
     model = ASRModel(
-        frontend=frontend,
+        frontend=make_frontend(args.frontend, args.batch_samplerate).to(device),
         encoder=encoder,
         vocab_size=vocab_size,
         feat_dim=feat_dim,
         proj_dim=args.embedding_dim,
         debug=args.debug
     ).to(device)
-    logger.info(f"Model built: {args.encoder}, feat_dim={feat_dim}, vocab_size={vocab_size}")
+    return model
 
-    # optionally build RNNT predictor+joiner
-    if args.mode == "rnnt":
-        if not HAVE_RNNT:
-            logger.error("warp_rnnt not available, cannot train RNN-T")
-            return
-        joiner = RNNTPredictorJoiner(model.enc_out_dim, vocab_size).to(device)
-        logger.info("Initialized RNNT predictor+joiner")
+def setup_optimizer(args, model, joiner=None):
+    """Set up the optimizer for training."""
+    params = list(model.parameters())
+    if joiner:
+        params.append(joiner.parameters())
 
-    # loss
-    if args.mode == "ctc":
-        criterion = nn.CTCLoss(blank=blank_id, zero_infinity=True)
-    else:
-        criterion = RNNTLoss(blank=blank_id)
-    logger.info(f"Using loss: {args.mode}")
-
-    # optimizer
     if args.optimizer == "adamw":
         optimizer = optim.AdamW(
-            list(model.parameters()) + ([joiner.parameters()] if args.mode=="rnnt" else []),
+            params,
             lr=args.lr,
             weight_decay=args.weight_decay,
             betas=(args.beta1, args.beta2),
@@ -138,28 +123,39 @@ def train(args):
     elif args.optimizer == "lion":
         from lion_pytorch import Lion
         optimizer = Lion(
-            list(model.parameters()) + ([joiner.parameters()] if args.mode=="rnnt" else []),
+            params,
             lr=args.lr,
             weight_decay=args.weight_decay,
         )
     else:
         optimizer = optim.Adam(
-            list(model.parameters()) + ([joiner.parameters()] if args.mode=="rnnt" else []),
+            params,
             lr=args.lr,
         )
-    logger.info(f"Optimizer: {args.optimizer}, lr={args.lr}")
+    return optimizer
 
-    # LR scheduling
-    def lr_lambda(step):
-        if step < args.warmup_steps:
-            return float(step) / float(max(1, args.warmup_steps))
-        progress = float(step - args.warmup_steps) / float(max(1, args.total_steps - args.warmup_steps))
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
+def setup_criterion(args, blank_id):
+    """Set up the loss function based on the training mode."""
+    if args.mode == "ctc":
+        criterion = nn.CTCLoss(blank=blank_id, zero_infinity=True)
+    else:
+        criterion = RNNTLoss(blank=blank_id)
+    return criterion
 
-    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    scaler = GradScaler()
+def lr_lambda(step, warmup_steps, total_steps):
+    """Learning rate scheduler lambda function."""
+    if step < warmup_steps:
+        return float(step) / float(max(1, warmup_steps))
+    progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+    return 0.5 * (1.0 + math.cos(math.pi * progress))
 
-    # dataset session
+def setup_learning_rate_scheduler(optimizer, args):
+    """Set up the learning rate scheduler."""
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lambda step: lr_lambda(step, args.warmup_steps, args.total_steps))
+    return scheduler
+
+def setup_dataset(args):
+    """Initialize and start the dataset session."""
     ds = dataset.SpeechDataset(
         config_path=args.config,
         verbose=args.verbose,
@@ -173,22 +169,103 @@ def train(args):
         min_duration=args.min_duration,
         max_duration=args.max_duration
     )
+    return ds
 
+def process_batch_item(ds, item, target_samples):
+    """Process a single batch item and handle any preprocessing errors."""
+    try:
+        audios, texts, masks = ds._load_and_preprocess_batch_item(item, target_samples)
+        return audios, texts, masks
+    except Exception as e:
+        logging.getLogger("train").error(f"Data preprocess error: {e}; trying to leave out batch item!")
+        return None
+
+def prepare_batch_data(batch_audio_items, batch_texts_items, batch_masks_items, seg_idx, target_samples, device):
+    """Prepare batch data for a specific segment index."""
+    slice_audio, slice_masks, slice_texts = [], [], []
+    for idx, (audios, texts, masks) in enumerate(zip(batch_audio_items, batch_texts_items, batch_masks_items)):
+        if seg_idx < len(audios):
+            slice_audio.append(audios[seg_idx])
+            slice_masks.append(masks[seg_idx])
+            slice_texts.append(texts[seg_idx])
+        else:
+            slice_audio.append(torch.zeros(target_samples, dtype=torch.float32))
+            slice_masks.append(torch.zeros(target_samples, dtype=torch.bool))
+            slice_texts.append("")
+
+    batch_tensor = torch.stack(slice_audio).to(device)
+    mask_tensor = torch.stack(slice_masks).to(device)
+    return batch_tensor, mask_tensor, slice_texts
+
+def prepare_tokens_and_lengths(slice_texts, sp, blank_id, device):
+    """Prepare token IDs and lengths for the batch texts."""
+    token_ids = [sp.encode(txt, out_type=int) for txt in slice_texts]
+    tgt_lens = [len(t) for t in token_ids]
+    max_tgt_len = max(tgt_lens)
+    tokens = torch.full((len(token_ids), max_tgt_len), blank_id, dtype=torch.long, device=device)
+    for i, t in enumerate(token_ids):
+        if t:
+            tokens[i, :len(t)] = torch.tensor(t, device=device)
+    return tokens, tgt_lens
+
+def train(args):
+    """Main training function."""
+    # Setup model directory and logging
+    model_dir = setup_model_directory(args)
+    logger = setup_logging(model_dir)
+    logger.info(f"Model directory: {model_dir}")
+
+    # Setup device for training
+    device, device_str = setup_device()
+    logger.info(f"Using device: {device}")
+
+    # Load SentencePiece model
+    sp, vocab_size, blank_id = load_sentencepiece_model(args)
+
+    # Build frontend and infer feature dimension
+    frontend = make_frontend(args.frontend, args.batch_samplerate).to(device)
+    with torch.no_grad():
+        dummy = torch.zeros(int(args.target_duration * args.batch_samplerate), device=device)
+        dummy = dummy.unsqueeze(0).unsqueeze(1)
+        feats = frontend(dummy)
+        feats = feats.transpose(1, 2).contiguous()
+        feat_dim = feats.shape[-1]
+
+    # Build and initialize the model
+    model = build_model(args, device, feat_dim, vocab_size)
+    logger.info(f"Model built: {args.encoder}, feat_dim={feat_dim}, vocab_size={vocab_size}")
+
+    # Optionally build RNNT predictor+joiner
+    joiner = None
+    if args.mode == "rnnt":
+        if not HAVE_RNNT:
+            logger.error("warp_rnnt not available, cannot train RNN-T")
+            return
+        joiner = RNNTPredictorJoiner(model.enc_out_dim, vocab_size).to(device)
+        logger.info("Initialized RNNT predictor+joiner")
+
+    # Setup loss function
+    criterion = setup_criterion(args, blank_id)
+    logger.info(f"Using loss: {args.mode}")
+
+    # Setup optimizer
+    optimizer = setup_optimizer(args, model, joiner)
+    logger.info(f"Optimizer: {args.optimizer}, lr={args.lr}")
+
+    # Setup learning rate scheduler and gradient scaler
+    scheduler = setup_learning_rate_scheduler(optimizer, args)
+    scaler = GradScaler()
+
+    # Initialize dataset session
+    ds = setup_dataset(args)
     prev_epoch = None
     global_step = 0
     logger.info(f"Starting training for {args.epochs} epochs")
-
     sr = ds.batch_samplerate
     target_samples = int(sr * args.target_duration)
+    losses = []
 
-    losses = [] # for running avg over the previous loss values
-    prev_epoch = None
-    global_step = 0
-    logger.info(f"Starting training for {args.epochs} epochs")
-
-    sr = ds.batch_samplerate
-    target_samples = int(sr * args.target_duration)
-
+    # Main training loop
     while True:
         try:
             epoch, batch_id, batch = ds.fetch_next_batch()
@@ -214,83 +291,49 @@ def train(args):
             break
 
         batch_audio_items, batch_texts_items, batch_masks_items = [], [], []
-
         for item in batch:
-            try:
-                audios, texts, masks = ds._load_and_preprocess_batch_item(item, target_samples)
-            except Exception as e:
-                logger.error(f"Data preprocess error: {e}; trying to leave out batch item!.")
-                continue
-
-            batch_audio_items.append(audios)
-            batch_texts_items.append(texts)
-            batch_masks_items.append(masks)
+            result = process_batch_item(ds, item, target_samples)
+            if result:
+                audios, texts, masks = result
+                batch_audio_items.append(audios)
+                batch_texts_items.append(texts)
+                batch_masks_items.append(masks)
 
         if not batch_audio_items:
-            logger.error(f"Batch is empty, probably due to previous errors. Retrying with a new batch after one second.")
+            logger.error("Batch is empty, probably due to previous errors. Retrying with a new batch after one second.")
             time.sleep(1)
             continue
 
         seg_counts = [len(segs) for segs in batch_audio_items]
         K = min(seg_counts) if ds.batch_segment_strategy == "clipping" else max(seg_counts)
 
-        # Clean state handling: single encoder_state, type depends on encoder
         encoder_state = None
-
         for seg_idx in range(K):
-            slice_audio, slice_masks, slice_texts = [], [], []
+            batch_tensor, mask_tensor, slice_texts = prepare_batch_data(batch_audio_items, batch_texts_items, batch_masks_items, seg_idx, target_samples, device)
 
-            for idx, (audios, texts, masks) in enumerate(zip(batch_audio_items, batch_texts_items, batch_masks_items)):
-                if seg_idx < len(audios):
-                    slice_audio.append(audios[seg_idx])
-                    slice_masks.append(masks[seg_idx])
-                    slice_texts.append(texts[seg_idx])
-                else:
-                    slice_audio.append(torch.zeros(target_samples, dtype=torch.float32))
-                    slice_masks.append(torch.zeros(target_samples, dtype=torch.bool))
-                    slice_texts.append("")
-
-            batch_tensor = torch.stack(slice_audio).to(device)
-            mask_tensor = torch.stack(slice_masks).to(device)
-
-            if args.debug:
-                print(f"[DEBUG] Batch shape: {tuple(batch_tensor.shape)}")
-                print(f"[DEBUG] Mask shape: {tuple(mask_tensor.shape)}")
+            debug_print(args.debug, f"Batch shape: {tuple(batch_tensor.shape)}")
+            debug_print(args.debug, f"Mask shape: {tuple(mask_tensor.shape)}")
 
             with torch.no_grad():
                 feats = frontend(batch_tensor)
             feats = feats.transpose(1, 2).contiguous()
 
-            token_ids = [sp.encode(txt, out_type=int) for txt in slice_texts]
-            tgt_lens = [len(t) for t in token_ids]
-            max_tgt_len = max(tgt_lens)
-
-            tokens = torch.full((len(token_ids), max_tgt_len), blank_id, dtype=torch.long, device=device)
-            for i, t in enumerate(token_ids):
-                if t:
-                    tokens[i, :len(t)] = torch.tensor(t, device=device)
-
+            tokens, tgt_lens = prepare_tokens_and_lengths(slice_texts, sp, blank_id, device)
             subsample = mask_tensor.size(1) // feats.size(1)
-            in_lens = (mask_tensor.sum(dim=1) // subsample)
-            # clamping to max length
-            in_lens = in_lens.clamp(max=feats.size(1)).long().tolist()
+            in_lens = (mask_tensor.sum(dim=1) // subsample).clamp(max=feats.size(1)).long().tolist()
 
-            if args.debug:
-                print(f"[DEBUG] Output {subsample=} and {in_lens=}")
-                print(f"[DEBUG] Tokens shape: {tuple(tokens.shape)}")
-                print(f"[DEBUG] Input lengths: {in_lens}")
-                print(f"[DEBUG] Target lengths: {tgt_lens}")
+            debug_print(args.debug, f"Output {subsample=} and {in_lens=}")
+            debug_print(args.debug, f"Tokens shape: {tuple(tokens.shape)}")
+            debug_print(args.debug, f"Input lengths: {in_lens}")
+            debug_print(args.debug, f"Target lengths: {tgt_lens}")
 
-            # Prepare input state for model
             if args.encoder == "lstm" and encoder_state is not None:
-                # already in (h, c) form — use as is
                 input_state = encoder_state
             else:
-                input_state = encoder_state  # None or list (xLSTM)
+                input_state = encoder_state
 
             with autocast(device_type=device_str, dtype=torch.float16):
                 enc_out, output_state = model(feats, input_state)
-
                 logp = enc_out.log_softmax(-1).transpose(0, 1)
                 loss = criterion(logp, tokens, in_lens, tgt_lens)
                 loss = loss / args.accumulation_steps
@@ -305,12 +348,11 @@ def train(args):
                 optimizer.zero_grad()
                 scheduler.step()
 
-            # Save detached states for next segment
             encoder_state = detach_states(output_state)
-
             global_step += 1
+
             if args.verbose or args.debug:
-                losses += [float(loss.item())]
+                losses.append(float(loss.item()))
                 if len(losses) >= 10:
                     avg_loss = sum(losses) / len(losses)
                     logger.info(f"[Step {global_step}] Loss: {avg_loss:.4f}")
@@ -333,35 +375,25 @@ def train(args):
     ds.end_session()
     logger.info("Training complete.")
 
-
 if __name__ == "__main__":
+    
     parser = argparse.ArgumentParser(description="Real ASR training loop")
     parser.add_argument("--config", default="config.yaml")
-    parser.add_argument("--sp-model", required=True,
-                        help="Path to SentencePiece model")
-    parser.add_argument("--frontend", choices=["mfcc", "mel"],
-                        default="mfcc", help="Feature frontend")
-    parser.add_argument("--encoder", choices=["lstm", "xlstm"],
-                        default="lstm")
-    parser.add_argument("--batch-samplerate", type=int,
-                        default=16000)
-    parser.add_argument("--batch-segment-strategy",
-                        choices=["clipping", "padding"],
-                        default="clipping")
+    parser.add_argument("--sp-model", required=True, help="Path to SentencePiece model")
+    parser.add_argument("--frontend", choices=["mfcc", "mel"], default="mfcc", help="Feature frontend")
+    parser.add_argument("--encoder", choices=["lstm", "xlstm"], default="lstm")
+    parser.add_argument("--batch-samplerate", type=int, default=16000)
+    parser.add_argument("--batch-segment-strategy", choices=["clipping", "padding"], default="clipping")
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--order", choices=["asc", "desc", "random"],
-                        default="asc")
+    parser.add_argument("--order", choices=["asc", "desc", "random"], default="asc")
     parser.add_argument("--min-duration", type=float, default=0.0)
     parser.add_argument("--max-duration", type=float, default=None)
     parser.add_argument("--target-duration", type=float, default=30.0)
-    parser.add_argument("--epochs", type=int, default=10,
-                        help="Number of training epochs")
+    parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
     parser.add_argument("--steps", type=int, default=None)
     parser.add_argument("--sleep", type=float, default=0.0)
-    parser.add_argument("--mode", choices=["ctc", "rnnt"],
-                        default="ctc")
-    parser.add_argument("--optimizer", choices=["adam", "adamw", "lion"],
-                        default="adamw")
+    parser.add_argument("--mode", choices=["ctc", "rnnt"], default="ctc")
+    parser.add_argument("--optimizer", choices=["adam", "adamw", "lion"], default="adamw")
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
     parser.add_argument("--beta1", type=float, default=0.9)
@@ -375,14 +407,12 @@ if __name__ == "__main__":
     parser.add_argument("--embedding-dim", type=int, default=128)
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--num-blocks", type=int, default=6)
-    parser.add_argument("--chunkwise-kernel", type=str,
-                        default="chunkwise--triton_xl_chunk")
-    parser.add_argument("--sequence-kernel", type=str,
-                        default="native_sequence__triton")
+    parser.add_argument("--chunkwise-kernel", type=str, default="chunkwise--triton_xl_chunk")
+    parser.add_argument("--sequence-kernel", type=str, default="native_sequence__triton")
     parser.add_argument("--step-kernel", type=str, default="triton")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode")
-    args = parser.parse_args()
 
+    args = parser.parse_args()
     train(args)
 
