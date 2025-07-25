@@ -13,9 +13,12 @@ from matplotlib import pyplot as plt
 from matplotlib import gridspec
 from pathlib import Path
 from parse_vtts import vtt_to_segments_with_text, parse_timestamp
+from urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
 
 class SpeechDataset:
     def __init__(self, config_path="config.yaml", verbose=False, debug_spectrograms=False, batch_segment_strategy="clipping", batch_samplerate=16000):
+        # Load configuration from YAML
         with open(config_path, "r") as f:
             self.config = yaml.safe_load(f)
         self.api_key = self.config["secret_api_key"]
@@ -30,11 +33,34 @@ class SpeechDataset:
         if self.debug_spectrograms:
             Path("plots").mkdir(parents=True, exist_ok=True)
 
+        # Setup persistent requests session with retry + keep-alive
+        self.session = requests.Session()
+        retries = Retry(
+            total=5,
+            connect=5,
+            read=5,
+            backoff_factor=1.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET", "POST"]
+        )
+        adapter = HTTPAdapter(
+            max_retries=retries,
+            pool_connections=100,
+            pool_maxsize=100
+        )
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
+        self.session.headers.update({
+            "Connection": "keep-alive",
+            "User-Agent": "SpeechDatasetClient/1.0"
+        })
+
     def _vprint(self, *args, **kwargs):
         if self.verbose:
             print("[INFO]", *args, **kwargs)
 
     def start_session(self, batch_size=8, order="asc", min_duration=0.0, max_duration=None):
+        # Initialize a training session on the remote server
         url = f"{self.api_url}/start_training_session/{self.api_key}"
         payload = {
             "language": self.language,
@@ -44,22 +70,21 @@ class SpeechDataset:
             "max_duration": max_duration,
         }
         self._vprint(f"Starting training session with batch_size={batch_size}, order={order}, min_dur={min_duration}, max_dur={max_duration}")
-        response = requests.post(url, json=payload)
-        if response.ok:
-            result = response.json()
-            if result["success"]:
-                self.session_id = result["session_id"]
-                self._vprint(f"Started session {self.session_id}")
-            else:
-                raise RuntimeError(f"Failed to start session: {result['error']}")
+        response = self.session.post(url, json=payload, timeout=10)
+        response.raise_for_status()
+        result = response.json()
+        if result["success"]:
+            self.session_id = result["session_id"]
+            self._vprint(f"Started session {self.session_id}")
         else:
-            raise RuntimeError(f"Failed to connect to server: {response.status_code}")
+            raise RuntimeError(f"Failed to start session: {result['error']}")
 
     def fetch_next_batch(self):
+        # Request the next training batch from the server
         url = f"{self.api_url}/get_next_batch/{self.session_id}/{self.api_key}"
         self._vprint("Fetching next batch...")
         try:
-            response = requests.get(url, timeout=10)
+            response = self.session.get(url, timeout=10)
         except requests.exceptions.RequestException as e:
             raise RuntimeError(f"Request error while fetching batch: {e}")
         if not response.ok:
@@ -74,10 +99,11 @@ class SpeechDataset:
         return result["epoch"], result["batch_id"], result["batch"]
 
     def mark_batch_done(self, epoch, batch_id):
+        # Notify the server that a batch has been processed
         url = f"{self.api_url}/mark_batch_done/{self.session_id}/{batch_id}/{self.api_key}?epoch={epoch}"
         self._vprint(f"Marking batch {batch_id} from epoch {epoch} as done...")
         try:
-            response = requests.post(url)
+            response = self.session.post(url, timeout=5)
         except Exception as e:
             print(f"[WARN] Network error during mark_batch_done: {e}")
             return
@@ -93,29 +119,33 @@ class SpeechDataset:
             print(f"[WARN] API error marking batch done: {result.get('error', 'Unknown error')}")
 
     def log(self, level, message):
+        # Post a log message to the server
         url = f"{self.api_url}/log/{self.session_id}/{self.api_key}"
         self._vprint(f"Logging: [{level}] {message}")
         try:
-            requests.post(url, json={"level": level, "message": message})
+            self.session.post(url, json={"level": level, "message": message}, timeout=5)
         except Exception:
             pass  # Non-fatal
 
     def end_session(self):
+        # End the training session
         url = f"{self.api_url}/end_training_session/{self.session_id}/{self.api_key}"
         self._vprint("Ending training session...")
-        requests.post(url)
-
+        try:
+            self.session.post(url, timeout=5)
+        except Exception:
+            pass
 
     def _load_and_preprocess_batch_item(self, item, target_samples):
         """Download one audio+VTT pair, split into fixed-length chunks, pad/trim,
         and return (audio_tensors, texts, masks)."""
-        # 1) Download & decode audio
         audio_url = item["cache_audio_url"]
         transcript_url = item["transcript_file"].replace('/var/www/', 'https://')
 
+        # 1) Download & decode audio
         try:
             self._vprint(f"Downloading audio from {audio_url}")
-            audio_resp = requests.get(audio_url, timeout=10)
+            audio_resp = self.session.get(audio_url, timeout=10)
             audio_resp.raise_for_status()
         except Exception as e:
             raise RuntimeError(f"Failed to download audio: {e}")
@@ -138,7 +168,7 @@ class SpeechDataset:
         # 2) Download & parse VTT
         try:
             self._vprint(f"Downloading transcript from {transcript_url}")
-            tr_resp = requests.get(transcript_url, timeout=10)
+            tr_resp = self.session.get(transcript_url, timeout=10)
             tr_resp.raise_for_status()
             segments = vtt_to_segments_with_text(tr_resp.text)
         except Exception as e:
@@ -172,6 +202,7 @@ class SpeechDataset:
                     chunks.append((prev_start, prev_end, [t for _, _, t in cur]))
                     # start next chunk
                     cur = [(start, end, text)]
+
         # whatever remains
         if cur:
             s0, e0, _ = cur[0]
@@ -243,4 +274,3 @@ class SpeechDataset:
         plt.close(fig)
         self._vprint(f"Saved plot to {fname}")
 
-    
