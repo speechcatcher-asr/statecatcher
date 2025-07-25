@@ -465,8 +465,8 @@ def train(args):
 
                 scaler.step(optimizer)
                 scaler.update()
-                optimizer.zero_grad()
                 scheduler.step()
+                optimizer.zero_grad()
 
             encoder_state = output_state
             global_step += 1
