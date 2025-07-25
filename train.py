@@ -281,8 +281,8 @@ def log_train_metrics(
     logger.info(f"[Step {global_step}] Loss: {avg_loss:.4f}, Train TER: {ter:.4f}")
 
     if args.debug and debug_ref is not None:
-        logger.debug(f"Reference [0]: {''.join(debug_ref)}")
-        logger.debug(f"Predicted [0]: {''.join(debug_pred)}")
+        debug_print(args.debug, f"Reference [0]: {''.join(debug_ref)}")
+        debug_print(args.debug, f"Predicted [0]: {''.join(debug_pred)}")
 
     return []
 
@@ -500,11 +500,11 @@ if __name__ == "__main__":
     parser.add_argument("--encoder", choices=["lstm", "xlstm"], default="lstm")
     parser.add_argument("--batch-samplerate", type=int, default=16000)
     parser.add_argument("--batch-segment-strategy", choices=["clipping", "padding"], default="clipping")
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--order", choices=["asc", "desc", "random"], default="asc")
     parser.add_argument("--min-duration", type=float, default=0.0)
     parser.add_argument("--max-duration", type=float, default=None)
-    parser.add_argument("--target-duration", type=float, default=30.0)
+    parser.add_argument("--target-duration", type=float, default=16.0)
     parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
     parser.add_argument("--steps", type=int, default=None)
     parser.add_argument("--sleep", type=float, default=0.0)
