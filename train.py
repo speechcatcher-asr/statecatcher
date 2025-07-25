@@ -12,9 +12,9 @@ from torch.amp import autocast, GradScaler
 import torchaudio
 import sentencepiece as spm
 import dataset
+import copy
 from model import make_frontend, ASRModel, build_encoder
 
-#torch.autograd.set_detect_anomaly(True)
 
 # Try to import RNN-T loss; if unavailable, only CTC will work
 try:
@@ -51,7 +51,18 @@ class RNNTPredictorJoiner(nn.Module):
         logits = self.joiner(joint)                     # (B, T, U, V)
         return logits
 
+def assert_all_detached(x):
+    if isinstance(x, torch.Tensor):
+        assert not x.requires_grad, "Tensor still requires grad"
+    elif isinstance(x, (list, tuple)):
+        for v in x:
+            assert_all_detached(v)
+    elif isinstance(x, dict):
+        for v in x.values():
+            assert_all_detached(v)
+
 def detach_states(states):
+    print(states)
     """Recursively detach all tensors in nested state structures (dicts, tuples, lists)."""
     if states is None:
         return None
@@ -59,23 +70,13 @@ def detach_states(states):
         return states.detach()
     elif isinstance(states, dict):
         return {k: detach_states(v) for k, v in states.items()}
-    elif isinstance(states, (list, tuple)):
-        return type(states)(detach_states(s) for s in states)
+    elif isinstance(states, tuple):
+        return tuple(detach_states(s) for s in states)
+    elif isinstance(states, list):
+        return [detach_states(s) for s in states]
     else:
         # Catch any unexpected data type (e.g., numbers, strings)
         return states
-
-def detach_states_old(states):
-    """Detach states from the computation graph to prevent backpropagation through them."""
-    if states is None:
-        return None
-    if isinstance(states, tuple):
-        return tuple(s.detach() for s in states)
-    elif isinstance(states, dict):
-        return {k: detach_states(v) for k, v in states.items()}
-    else:
-        print(states)
-        return states.detach()
 
 def debug_print(debug, *args):
     """Helper function to print debug messages."""
@@ -384,6 +385,10 @@ def train(args):
                 input_state = encoder_state
 
             with autocast(device_type=device_str, dtype=torch.float16):
+                if input_state:
+                    input_state = detach_states(input_state)
+                    if args.debug:
+                        assert_all_detached(input_state)
                 enc_out, output_state = model(feats, input_state)
                 logp = enc_out.log_softmax(-1).transpose(0, 1)
                 loss = criterion(logp, tokens, in_lens, tgt_lens)
@@ -410,7 +415,7 @@ def train(args):
                 optimizer.zero_grad()
                 scheduler.step()
 
-            encoder_state = detach_states(output_state)
+            encoder_state = output_state
             global_step += 1
 
             if args.verbose or args.debug:
@@ -482,5 +487,9 @@ if __name__ == "__main__":
     parser.add_argument("--debug", action="store_true", help="Enable debug mode")
 
     args = parser.parse_args()
+
+    if args.debug:
+        torch.autograd.set_detect_anomaly(True)
+
     train(args)
 
