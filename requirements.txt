@@ -11,3 +11,4 @@ soundfile
 mlstm_kernels
 xlstm
 lion-pytorch
+jiwer
