@@ -12,7 +12,7 @@ from torch.amp import autocast, GradScaler
 import torchaudio
 import sentencepiece as spm
 import dataset
-import copy
+from jiwer import wer
 from model import make_frontend, ASRModel, build_encoder
 
 
@@ -62,7 +62,6 @@ def assert_all_detached(x):
             assert_all_detached(v)
 
 def detach_states(states):
-    print(states)
     """Recursively detach all tensors in nested state structures (dicts, tuples, lists)."""
     if states is None:
         return None
@@ -234,10 +233,64 @@ def prepare_tokens_and_lengths(slice_texts, sp, blank_id, device):
             tokens[i, :len(t)] = torch.tensor(t, device=device)
     return tokens, tgt_lens
 
+from jiwer import wer
+
+def log_train_metrics(
+    args, run, logger, losses, enc_out, tokens, tgt_lens, in_lens, sp, blank_id, global_step
+):
+    """Compute and log average loss and TER every 10 steps."""
+    losses.append(float(losses[-1]))  # Make sure the current loss is included
+
+    if len(losses) < 10:
+        return losses  # Wait until we have 10 losses
+
+    avg_loss = sum(losses) / len(losses)
+    all_preds, all_refs = [], []
+    debug_ref = debug_pred = None
+
+    with torch.no_grad():
+        top_tokens = enc_out.argmax(dim=-1)  # [B, T]
+        for i in range(len(in_lens)):
+            pred_ids = top_tokens[i, :in_lens[i]].tolist()
+            pred_ids = [tid for tid in pred_ids if tid != blank_id]
+            ref_ids = tokens[i, :tgt_lens[i]].tolist()
+
+            pred_str = sp.decode_ids(pred_ids)
+            ref_str = sp.decode_ids(ref_ids)
+
+            pred_str_tok = " ".join(pred_str)
+            ref_str_tok = " ".join(ref_str)
+
+            all_preds.append(pred_str_tok)
+            all_refs.append(ref_str_tok)
+
+            if args.debug and i == 0:
+                debug_ref = ref_str
+                debug_pred = pred_str
+
+    try:
+        ter = wer(all_refs, all_preds)
+    except Exception as e:
+        logger.warning(f"Error computing TER: {e}")
+        ter = -1.0
+
+    if run is not None:
+        run.track(avg_loss, name="avg_loss_10", step=global_step)
+        run.track(ter, name="train_ter_10", step=global_step)
+
+    logger.info(f"[Step {global_step}] Loss: {avg_loss:.4f}, Train TER: {ter:.4f}")
+
+    if args.debug and debug_ref is not None:
+        logger.debug(f"Reference [0]: {''.join(debug_ref)}")
+        logger.debug(f"Predicted [0]: {''.join(debug_pred)}")
+
+    return []
+
+
 def train(args):
     """Main training function."""
     if HAVE_AIM:
-        run = aim.Run(experiment="asr_training")
+        run = aim.Run(experiment="asr_statecatcher")
     else:
         run = None
 
@@ -418,14 +471,8 @@ def train(args):
             encoder_state = output_state
             global_step += 1
 
-            if args.verbose or args.debug:
-                losses.append(float(loss.item()))
-                if len(losses) >= 10:
-                    avg_loss = sum(losses) / len(losses)
-                    if HAVE_AIM:
-                        run.track(avg_loss, name="avg_loss_10", step=global_step)
-                    logger.info(f"[Step {global_step}] Loss: {avg_loss:.4f}")
-                    losses = []
+            # log train losses every 10 steps, compute TER 
+            losses = log_train_metrics(args, run, logger, losses + [loss.item()], enc_out, tokens, tgt_lens, in_lens, sp, blank_id, global_step)
 
             if args.steps and global_step >= args.steps:
                 break
