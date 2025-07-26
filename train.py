@@ -287,19 +287,41 @@ def log_train_metrics(
 
     return []
 
+def save_checkpoint(model_dir, model, joiner, epoch, global_step=None, logger=None):
+    """Save a model checkpoint."""
+    if global_step is not None:
+        ckpt_filename = f"model_epoch{epoch + 1}_step{global_step}.pt"
+    else:
+        ckpt_filename = f"model_epoch{epoch + 1}.pt"
+
+    ckpt_path = os.path.join(model_dir, ckpt_filename)
+    torch.save({
+        "model": model.state_dict(),
+        **({"joiner": joiner.state_dict()} if joiner is not None else {})
+    }, ckpt_path)
+
+    if logger is not None:
+        logger.info(f"Saved checkpoint: {ckpt_path}")
+
+    return ckpt_path
 
 def train(args):
     """Main training function."""
+    
+    # Setup model directory and logging
+    model_dir = setup_model_directory(args)
+    model_dir_last_folder = model_dir.split('/')[-1]
+    experiment_name = f"asr_statecatcher_{model_dir_last_folder}"
+
     if HAVE_AIM:
-        run = aim.Run(experiment="asr_statecatcher")
+        run = aim.Run(experiment=experiment_name)
     else:
         run = None
 
-    # Setup model directory and logging
-    model_dir = setup_model_directory(args)
     logger = setup_logging(model_dir)
     logger.info(f"Model directory: {model_dir}")
-    logger.info("Aim logging enabled." if HAVE_AIM else "Aim not available. Skipping experiment logging.")
+    logger.info("Aim logging enabled." if HAVE_AIM else "Aim not available. Skipping aim experiment logging."
+                "You can activate aim by running 'pip3 install aim' followed by 'aim up'.")
 
     # Setup device for training
     device, device_str = setup_device()
@@ -307,7 +329,6 @@ def train(args):
 
     # Load SentencePiece model
     sp, vocab_size, blank_id = load_sentencepiece_model(args)
-
     logger.info(f"Vocab size (output tokens): {vocab_size}")
 
     # Build frontend and infer feature dimension
@@ -378,15 +399,11 @@ def train(args):
             time.sleep(10)
             continue
 
+        # save model after every epoch
         if prev_epoch is None:
             prev_epoch = epoch
         elif epoch != prev_epoch:
-            ckpt = os.path.join(model_dir, f"model_epoch{prev_epoch+1}.pt")
-            torch.save({
-                "model": model.state_dict(),
-                **({"joiner": joiner.state_dict()} if args.mode == "rnnt" else {})
-            }, ckpt)
-            logger.info(f"Saved checkpoint: {ckpt}")
+            save_checkpoint(model_dir, model, joiner if args.mode == "rnnt" else None, prev_epoch, logger=logger)
             if prev_epoch + 1 >= args.epochs:
                 break
             prev_epoch = epoch
@@ -490,6 +507,10 @@ def train(args):
 
                 optimizer.zero_grad()
 
+            # Save model every n updates
+            if args.save_every_n_updates is not None and (global_step + 1) % args.save_every_n_updates == 0:
+                save_checkpoint(model_dir, model, joiner if args.mode == "rnnt" else None, epoch, global_step + 1, logger)
+
             encoder_state = output_state
             global_step += 1
 
@@ -550,6 +571,7 @@ if __name__ == "__main__":
     parser.add_argument("--chunkwise-kernel", type=str, default="chunkwise--native_autograd")
     parser.add_argument("--sequence-kernel", type=str, default="native_sequence__native")
     parser.add_argument("--step-kernel", type=str, default="native")
+    parser.add_argument("--save-every-n-updates", type=int, default=None, help="Save model every n updates")
     # with triton:
     #parser.add_argument("--chunkwise-kernel", type=str, default="chunkwise--triton_xl_chunk")
     #parser.add_argument("--sequence-kernel", type=str, default="native_sequence__triton")
