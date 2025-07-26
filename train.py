@@ -9,12 +9,13 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.amp import autocast, GradScaler
+import torch.nn.functional as F
 import torchaudio
 import sentencepiece as spm
 import dataset
 from jiwer import wer
 from model import make_frontend, ASRModel, build_encoder
-
+from decoder import ctc_greedy_decoder
 
 # Try to import RNN-T loss; if unavailable, only CTC will work
 try:
@@ -233,36 +234,36 @@ def prepare_tokens_and_lengths(slice_texts, sp, blank_id, device):
             tokens[i, :len(t)] = torch.tensor(t, device=device)
     return tokens, tgt_lens
 
-from jiwer import wer
-
 def log_train_metrics(
     args, run, logger, losses, enc_out, tokens, tgt_lens, in_lens, sp, blank_id, global_step
 ):
-    """Compute and log average loss and TER every 10 steps."""
-    losses.append(float(losses[-1]))  # Make sure the current loss is included
-
+    losses.append(float(losses[-1]))
     if len(losses) < 10:
-        return losses  # Wait until we have 10 losses
+        return losses
 
     avg_loss = sum(losses) / len(losses)
     all_preds, all_refs = [], []
     debug_ref = debug_pred = None
 
     with torch.no_grad():
-        top_tokens = enc_out.argmax(dim=-1)  # [B, T]
-        for i in range(len(in_lens)):
-            pred_ids = top_tokens[i, :in_lens[i]].tolist()
-            pred_ids = [tid for tid in pred_ids if tid != blank_id]
+        # Step 1: Trim padded encoder output using in_lens
+        trimmed = [enc_out[i, :in_lens[i]] for i in range(enc_out.size(0))]
+
+        # Step 2: Pad back to a batch tensor and log_softmax
+        log_probs = torch.nn.utils.rnn.pad_sequence(trimmed, batch_first=True)
+        log_probs = log_probs.log_softmax(dim=-1)  # [B, T, V]
+
+        # Step 3: Run CTC greedy decoding
+        decoded = ctc_greedy_decoder(log_probs, torch.tensor(in_lens, device=enc_out.device), blank=blank_id)
+
+        for i, pred_ids in enumerate(decoded):
             ref_ids = tokens[i, :tgt_lens[i]].tolist()
 
             pred_str = sp.decode_ids(pred_ids)
             ref_str = sp.decode_ids(ref_ids)
 
-            pred_str_tok = " ".join(pred_str)
-            ref_str_tok = " ".join(ref_str)
-
-            all_preds.append(pred_str_tok)
-            all_refs.append(ref_str_tok)
+            all_preds.append(" ".join(pred_str))
+            all_refs.append(" ".join(ref_str))
 
             if args.debug and i == 0:
                 debug_ref = ref_str
@@ -355,9 +356,9 @@ def train(args):
     optimizer = setup_optimizer(args, model, joiner)
     logger.info(f"Optimizer: {args.optimizer}, lr={args.lr}")
 
-    # Setup learning rate scheduler and gradient scaler
-    scheduler = setup_learning_rate_scheduler(optimizer, args)
-    scaler = GradScaler()
+    # Optional scheduler and scaler
+    scheduler = setup_learning_rate_scheduler(optimizer, args) if args.use_scheduler else None
+    scaler = GradScaler() if args.use_scaler else None
 
     # Initialize dataset session
     ds = setup_dataset(args)
@@ -437,7 +438,20 @@ def train(args):
             else:
                 input_state = encoder_state
 
-            with autocast(device_type=device_str, dtype=torch.float16):
+            if args.use_scaler:
+                with autocast(device_type=device_str, dtype=torch.float16):
+                    if input_state:
+                        input_state = detach_states(input_state)
+                        if args.debug:
+                            assert_all_detached(input_state)
+                    enc_out, output_state = model(feats, input_state)
+                    logp = enc_out.log_softmax(-1).transpose(0, 1)
+                    loss = criterion(logp, tokens, in_lens, tgt_lens)
+                    loss = loss / args.accumulation_steps
+
+                scaler.scale(loss).backward()
+
+            else:
                 if input_state:
                     input_state = detach_states(input_state)
                     if args.debug:
@@ -447,13 +461,15 @@ def train(args):
                 loss = criterion(logp, tokens, in_lens, tgt_lens)
                 loss = loss / args.accumulation_steps
 
-            scaler.scale(loss).backward()
+                loss.backward()
 
             if HAVE_AIM:
                 run.track(loss.item(), name="loss", step=global_step)
 
             if (global_step + 1) % args.accumulation_steps == 0:
-                scaler.unscale_(optimizer)
+                if scaler is not None:
+                    scaler.unscale_(optimizer)
+                
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
                 if HAVE_AIM:
@@ -463,9 +479,15 @@ def train(args):
                             grad_norm += p.grad.data.norm(2).item() ** 2
                     run.track(grad_norm ** 0.5, name="grad_norm", step=global_step)
 
-                scaler.step(optimizer)
-                scaler.update()
-                scheduler.step()
+                if scaler is not None:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+
+                if scheduler is not None:
+                    scheduler.step()
+
                 optimizer.zero_grad()
 
             encoder_state = output_state
@@ -509,14 +531,16 @@ if __name__ == "__main__":
     parser.add_argument("--steps", type=int, default=None)
     parser.add_argument("--sleep", type=float, default=0.0)
     parser.add_argument("--mode", choices=["ctc", "rnnt"], default="ctc")
-    parser.add_argument("--optimizer", choices=["adam", "adamw", "lion"], default="adamw")
+    parser.add_argument("--optimizer", choices=["adam", "adamw", "lion"], default="adam")
+    parser.add_argument("--use-scaler", action="store_true", help="Enable AMP gradient scaler (default: off)")
+    parser.add_argument("--use-scheduler", action="store_true", help="Enable learning rate scheduler (default: off)")
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
     parser.add_argument("--beta1", type=float, default=0.9)
     parser.add_argument("--beta2", type=float, default=0.98)
     parser.add_argument("--warmup-steps", type=int, default=10000)
     parser.add_argument("--total-steps", type=int, default=100000)
-    parser.add_argument("--accumulation-steps", type=int, default=4)
+    parser.add_argument("--accumulation-steps", type=int, default=1)
     parser.add_argument("--max-grad-norm", type=float, default=5.0)
     parser.add_argument("--hidden-size", type=int, default=512)
     parser.add_argument("--num-layers", type=int, default=4)
