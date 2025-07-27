@@ -16,7 +16,7 @@ import sentencepiece as spm
 import dataset
 from typing import Optional, Tuple, Any
 from jiwer import wer
-from model import make_frontend, ASRModel, build_encoder
+from model import make_frontend, ASRModel, build_encoder, RNNTPredictorJoiner, compute_loss
 from decoder import ctc_greedy_decoder
 
 # Try to import RNN-T loss; if unavailable, only CTC will work
@@ -32,27 +32,6 @@ try:
 except ImportError:
     HAVE_AIM = False
 
-class RNNTPredictorJoiner(nn.Module):
-    """
-    Minimal RNN-T predictor+joiner:
-      - Embeds the label sequence (including blank prefix)
-      - Adds encoder and predictor embeddings
-      - Projects to vocab-size logits
-    """
-    def __init__(self, enc_dim: int, vocab_size: int):
-        super().__init__()
-        self.embedding = nn.Embedding(vocab_size, enc_dim)
-        self.joiner = nn.Linear(enc_dim, vocab_size)
-
-    def forward(self, enc_out: torch.Tensor, prefix: torch.Tensor):
-        # enc_out: (B, T, enc_dim)
-        # prefix:  (B, U, enc_dim) via embedding
-        pred_emb = self.embedding(prefix)               # (B, U, enc_dim)
-        # broadcast sum
-        joint = enc_out.unsqueeze(2) + pred_emb.unsqueeze(1)  # (B, T, U, enc_dim)
-        joint = torch.tanh(joint)
-        logits = self.joiner(joint)                     # (B, T, U, V)
-        return logits
 
 def assert_all_detached(x):
     if isinstance(x, torch.Tensor):
@@ -313,72 +292,6 @@ def save_checkpoint(model_dir, model, joiner, epoch, global_step=None, logger=No
 
     return ckpt_path
 
-def compute_loss(
-    mode: str,
-    criterion: nn.Module,
-    model: nn.Module,
-    feats: torch.Tensor,              # (B, T, F)
-    tokens: torch.Tensor,             # (B, U)
-    in_lens: torch.Tensor,            # (B,)
-    tgt_lens: torch.Tensor,           # (B,)
-    blank_id: int,
-    use_rnnt_joiner: Optional[nn.Module] = None,
-    input_state: Optional[Any] = None,
-    args=None
-) -> Tuple[torch.Tensor, Optional[Any]]:
-    """
-    Computes loss (CTC or RNN-T) given model, features, and labels.
-
-    Returns:
-        loss: scalar tensor
-        output_state: model's output state (for stateful models)
-    """
-    # Detach input state if present
-    if input_state:
-        input_state = detach_states(input_state)
-        if args and args.debug:
-            assert_all_detached(input_state)
-
-    # Forward pass through model
-    enc_out, output_state = model(feats, input_state)  # (B, T, D)
-
-    if mode == "ctc":
-        # CTC expects (T, B, V) after log_softmax
-        logp = enc_out.log_softmax(-1).transpose(0, 1)  # (T, B, V)
-        loss = criterion(logp, tokens, in_lens, tgt_lens)
-
-    elif mode == "rnnt":
-        assert use_rnnt_joiner is not None, "Joiner module required for RNN-T mode"
-
-        # Add blank token as prefix to labels for predictor input
-        blank_prefix = torch.full(
-            (tokens.size(0), 1),
-            blank_id,
-            dtype=tokens.dtype,
-            device=tokens.device
-        )
-        predictor_input = torch.cat([blank_prefix, tokens], dim=1)  # (B, U + 1)
-
-        # RNN-T joiner forward pass: logits shape (B, T, U+1, V)
-        logits = use_rnnt_joiner(enc_out, predictor_input)
-
-        # warp_rnnt expects float32
-        log_probs = logits.log_softmax(dim=-1).to(torch.float32)
-
-        # Labels for loss must be (B, U)
-        loss = criterion(
-            log_probs=log_probs,
-            labels=tokens,
-            frames_lengths=in_lens,
-            labels_lengths=tgt_lens,
-            blank=blank_id
-        )
-
-    else:
-        raise ValueError(f"Unknown mode: {mode}")
-
-    return loss, output_state, enc_out, output_state
-
 
 def train(args):
     """Main training function."""
@@ -442,7 +355,7 @@ def train(args):
             logger.error("warp_rnnt not available, cannot train RNN-T")
             return
         joiner = RNNTPredictorJoiner(model.enc_out_dim, vocab_size).to(device)
-        logger.info("Initialized RNNT predictor+joiner")
+        logger.info(f"Initialized RNNT predictor+joiner with {model.enc_out_dim=} and {vocab_size=}.")
 
     # Setup loss function
     criterion = setup_criterion(args, blank_id)
