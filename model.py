@@ -16,7 +16,8 @@ def compute_loss(
     blank_id: int,
     use_rnnt_joiner: Optional[nn.Module] = None,
     input_state: Optional[Any] = None,
-    args=None
+    args=None,
+    compact=False
 ) -> Tuple[torch.Tensor, Optional[Any]]:
     """
     Computes loss (CTC or RNN-T) given model, features, and labels.
@@ -52,7 +53,10 @@ def compute_loss(
         predictor_input = torch.cat([blank_prefix, tokens], dim=1)  # (B, U + 1)
 
         # RNN-T joiner forward pass: logits shape (B, T, U+1, V)
-        logits = use_rnnt_joiner(enc_out, predictor_input)
+        if args.compact_rnnt:
+            logits = use_rnnt_joiner(enc_out, predictor_input, in_lens, tgt_lens)
+        else:
+            logits = use_rnnt_joiner(enc_out, predictor_input)
 
         # warp_rnnt expects float32
         log_probs = logits.log_softmax(dim=-1)
@@ -65,8 +69,8 @@ def compute_loss(
             labels=tokens,
             frames_lengths=in_lens,
             labels_lengths=tgt_lens,
-            blank=blank_id,
-            compact=True,
+            blank_id=blank_id,
+            compact=compact,
             gather=True
         )
 
@@ -110,6 +114,60 @@ class RNNTPredictorJoiner(nn.Module):
         logits = self.joiner(joint)                 # (B, T, U, vocab_size)
         return logits
 
+class RNNTCompactPredictorJoiner(nn.Module):
+    def __init__(self, enc_out_dim: int, pred_emb_dim: int, join_dim: int, vocab_size: int, debug: bool = True):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, pred_emb_dim)
+        self.enc_proj = nn.Linear(enc_out_dim, join_dim)
+        self.pred_proj = nn.Linear(pred_emb_dim, join_dim)
+        self.joiner = nn.Linear(join_dim, vocab_size)
+        self.debug = debug
+
+    def forward_compact(
+        self,
+        enc_out: torch.Tensor,      # (B, T, enc_out_dim)
+        prefix: torch.Tensor,       # (B, U)
+        in_lens: torch.Tensor,      # (B,)
+        tgt_lens: torch.Tensor      # (B,)
+    ) -> torch.Tensor:
+        """
+        Computes (STU, V) logits for compact RNN-T loss.
+        """
+        B = enc_out.size(0)
+        device = enc_out.device
+
+        enc_proj = self.enc_proj(enc_out)     # (B, T, J)
+        pred_emb = self.embedding(prefix)     # (B, U, E)
+        pred_proj = self.pred_proj(pred_emb)  # (B, U, J)
+
+        enc_list = []
+        pred_list = []
+
+        for b in range(B):
+            T = in_lens[b]
+            U = tgt_lens[b] + 1  # include blank prefix
+
+            # Get enc_proj[b, :T] → (T, J)
+            # Get pred_proj[b, :U] → (U, J)
+            enc_b = enc_proj[b, :T]             # (T, J)
+            pred_b = pred_proj[b, :U]           # (U, J)
+
+            # Cartesian product: (T, J) + (U, J) → (T * U, J)
+            enc_b_rep = enc_b.unsqueeze(1).expand(T, U, -1)
+            pred_b_rep = pred_b.unsqueeze(0).expand(T, U, -1)
+
+            joint = torch.tanh(enc_b_rep + pred_b_rep)     # (T, U, J)
+            joint = joint.reshape(-1, joint.size(-1))      # (T*U, J)
+
+            enc_list.append(joint)
+
+        all_joint = torch.cat(enc_list, dim=0)              # (STU, J)
+        logits = self.joiner(all_joint)                     # (STU, V)
+        return logits
+
+
+    def forward(self, enc_out, prefix, in_lens, tgt_lens):
+        return self.forward_compact(enc_out, prefix, in_lens, tgt_lens)
 
 def build_encoder(args, vocab_size, feat_dim=80):
      if args.encoder == "lstm":

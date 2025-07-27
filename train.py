@@ -16,7 +16,7 @@ import sentencepiece as spm
 import dataset
 from typing import Optional, Tuple, Any
 from jiwer import wer
-from model import make_frontend, ASRModel, build_encoder, RNNTPredictorJoiner, compute_loss
+from model import make_frontend, ASRModel, build_encoder, RNNTPredictorJoiner, RNNTCompactPredictorJoiner, compute_loss
 from decoder import ctc_greedy_decoder
 
 # Try to import RNN-T loss; if unavailable, only CTC will work
@@ -351,10 +351,11 @@ def train(args):
     # Optionally build RNNT predictor+joiner
     joiner = None
     if args.mode == "rnnt":
+        rnnt_pred_joiner_class = RNNTCompactPredictorJoiner if args.compact_rnnt else RNNTPredictorJoiner
         if not HAVE_RNNT:
             logger.error("warp_rnnt not available, cannot train RNN-T")
             return
-        joiner = RNNTPredictorJoiner(enc_out_dim=model.enc_out_dim, pred_emb_dim=args.rnnt_pred_emb_dim,
+        joiner = rnnt_pred_joiner_class(enc_out_dim=model.enc_out_dim, pred_emb_dim=args.rnnt_pred_emb_dim,
                                      join_dim=args.rnnt_joiner_dim, vocab_size=vocab_size).to(device)
         logger.info(f"Initialized RNNT predictor+joiner with {model.enc_out_dim=} and {vocab_size=}.")
 
@@ -452,7 +453,7 @@ def train(args):
                         feats=feats, tokens=tokens, in_lens=in_lens,
                         tgt_lens=tgt_lens, blank_id=blank_id,
                         use_rnnt_joiner=joiner if args.mode == "rnnt" else None,
-                        input_state=input_state, args=args)
+                        input_state=input_state, args=args, compact=args.compact_rnnt)
 
                     loss = loss / args.accumulation_steps
 
@@ -540,6 +541,7 @@ if __name__ == "__main__":
     parser.add_argument("--steps", type=int, default=None)
     parser.add_argument("--sleep", type=float, default=0.0)
     parser.add_argument("--mode", choices=["ctc", "rnnt"], default="ctc")
+    parser.add_argument("--compact-rnnt", action="store_true")
     parser.add_argument("--optimizer", choices=["adam", "adamw", "lion"], default="adam")
     parser.add_argument("--use-scaler", action="store_true", help="Enable AMP gradient scaler (default: off)")
     parser.add_argument("--use-scheduler", action="store_true", help="Enable learning rate scheduler (default: off)")
