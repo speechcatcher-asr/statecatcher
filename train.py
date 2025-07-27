@@ -5,6 +5,7 @@ import shutil
 import time
 import math
 import logging
+import json
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -13,6 +14,7 @@ import torch.nn.functional as F
 import torchaudio
 import sentencepiece as spm
 import dataset
+from typing import Optional, Tuple, Any
 from jiwer import wer
 from model import make_frontend, ASRModel, build_encoder
 from decoder import ctc_greedy_decoder
@@ -88,7 +90,13 @@ def setup_model_directory(args):
     timestamp = str(int(time.time()))
     model_dir = os.path.join("models", timestamp)
     os.makedirs(model_dir, exist_ok=True)
-    shutil.copy(args.config, os.path.join(model_dir, "config.yaml"))
+    
+    # Save command-line arguments to a JSON file
+    args_dict = vars(args)
+    args_json_path = os.path.join(model_dir, "training_args.json")
+    with open(args_json_path, 'w') as json_file:
+        json.dump(args_dict, json_file, indent=4)
+
     return model_dir
 
 def setup_logging(model_dir):
@@ -137,7 +145,7 @@ def setup_optimizer(args, model, joiner=None):
     """Set up the optimizer for training."""
     params = list(model.parameters())
     if joiner:
-        params.append(joiner.parameters())
+        params += list(joiner.parameters())
 
     if args.optimizer == "adamw":
         optimizer = optim.AdamW(
@@ -165,7 +173,7 @@ def setup_criterion(args, blank_id):
     if args.mode == "ctc":
         criterion = nn.CTCLoss(blank=blank_id, zero_infinity=True)
     else:
-        criterion = RNNTLoss(blank=blank_id)
+        criterion = RNNTLoss
     return criterion
 
 def lr_lambda(step, warmup_steps, total_steps):
@@ -305,6 +313,73 @@ def save_checkpoint(model_dir, model, joiner, epoch, global_step=None, logger=No
 
     return ckpt_path
 
+def compute_loss(
+    mode: str,
+    criterion: nn.Module,
+    model: nn.Module,
+    feats: torch.Tensor,              # (B, T, F)
+    tokens: torch.Tensor,             # (B, U)
+    in_lens: torch.Tensor,            # (B,)
+    tgt_lens: torch.Tensor,           # (B,)
+    blank_id: int,
+    use_rnnt_joiner: Optional[nn.Module] = None,
+    input_state: Optional[Any] = None,
+    args=None
+) -> Tuple[torch.Tensor, Optional[Any]]:
+    """
+    Computes loss (CTC or RNN-T) given model, features, and labels.
+
+    Returns:
+        loss: scalar tensor
+        output_state: model's output state (for stateful models)
+    """
+    # Detach input state if present
+    if input_state:
+        input_state = detach_states(input_state)
+        if args and args.debug:
+            assert_all_detached(input_state)
+
+    # Forward pass through model
+    enc_out, output_state = model(feats, input_state)  # (B, T, D)
+
+    if mode == "ctc":
+        # CTC expects (T, B, V) after log_softmax
+        logp = enc_out.log_softmax(-1).transpose(0, 1)  # (T, B, V)
+        loss = criterion(logp, tokens, in_lens, tgt_lens)
+
+    elif mode == "rnnt":
+        assert use_rnnt_joiner is not None, "Joiner module required for RNN-T mode"
+
+        # Add blank token as prefix to labels for predictor input
+        blank_prefix = torch.full(
+            (tokens.size(0), 1),
+            blank_id,
+            dtype=tokens.dtype,
+            device=tokens.device
+        )
+        predictor_input = torch.cat([blank_prefix, tokens], dim=1)  # (B, U + 1)
+
+        # RNN-T joiner forward pass: logits shape (B, T, U+1, V)
+        logits = use_rnnt_joiner(enc_out, predictor_input)
+
+        # warp_rnnt expects float32
+        log_probs = logits.log_softmax(dim=-1).to(torch.float32)
+
+        # Labels for loss must be (B, U)
+        loss = criterion(
+            log_probs=log_probs,
+            labels=tokens,
+            frames_lengths=in_lens,
+            labels_lengths=tgt_lens,
+            blank=blank_id
+        )
+
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+
+    return loss, output_state, enc_out, output_state
+
+
 def train(args):
     """Main training function."""
     
@@ -358,7 +433,7 @@ def train(args):
             "accumulation_steps": args.accumulation_steps
         }
         run["model/num_params"] = sum(p.numel() for p in model.parameters())
-        run["tags"] = ['rnnt'] if args.mode == 'rnnt' else ['ctc']
+        run["tags"] = ['rnnt'] if args.mode == 'rnnt' else ['ctc'] + [args.encoder]
 
     # Optionally build RNNT predictor+joiner
     joiner = None
@@ -455,31 +530,30 @@ def train(args):
             else:
                 input_state = encoder_state
 
+            # calculate loss (E.g. CTC or RNN-T)
             if args.use_scaler:
                 with autocast(device_type=device_str, dtype=torch.float16):
-                    if input_state:
-                        input_state = detach_states(input_state)
-                        if args.debug:
-                            assert_all_detached(input_state)
-                    enc_out, output_state = model(feats, input_state)
-                    logp = enc_out.log_softmax(-1).transpose(0, 1)
-                    loss = criterion(logp, tokens, in_lens, tgt_lens)
+                    loss, output_state, enc_out, output_state = compute_loss(
+                        mode=args.mode, criterion=criterion, model=model,
+                        feats=feats, tokens=tokens, in_lens=in_lens,
+                        tgt_lens=tgt_lens, blank_id=blank_id,
+                        use_rnnt_joiner=joiner if args.mode == "rnnt" else None,
+                        input_state=input_state, args=args)
+
                     loss = loss / args.accumulation_steps
 
                 scaler.scale(loss).backward()
 
             else:
-                if input_state:
-                    input_state = detach_states(input_state)
-                    if args.debug:
-                        assert_all_detached(input_state)
-                enc_out, output_state = model(feats, input_state)
-                logp = enc_out.log_softmax(-1).transpose(0, 1)
-                loss = criterion(logp, tokens, in_lens, tgt_lens)
+                loss, output_statie, enc_out, output_state = compute_loss(
+                    mode=args.mode, criterion=criterion, model=model,
+                    feats=feats, tokens=tokens, in_lens=in_lens,
+                    tgt_lens=tgt_lens, blank_id=blank_id,
+                    use_rnnt_joiner=joiner if args.mode == "rnnt" else None,
+                    input_state=input_state, args=args)
                 loss = loss / args.accumulation_steps
-
                 loss.backward()
-
+           
             if HAVE_AIM:
                 run.track(loss.item(), name="loss", step=global_step)
 
