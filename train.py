@@ -115,7 +115,7 @@ def build_model(args, device, feat_dim, vocab_size):
         encoder=encoder,
         vocab_size=vocab_size,
         feat_dim=feat_dim,
-        proj_dim=args.embedding_dim,
+        proj_dim=args.input_proj_dim,
         debug=args.debug
     ).to(device)
     return model
@@ -354,7 +354,8 @@ def train(args):
         if not HAVE_RNNT:
             logger.error("warp_rnnt not available, cannot train RNN-T")
             return
-        joiner = RNNTPredictorJoiner(model.enc_out_dim, vocab_size).to(device)
+        joiner = RNNTPredictorJoiner(enc_out_dim=model.enc_out_dim, pred_emb_dim=args.rnnt_pred_emb_dim,
+                                     join_dim=args.rnnt_joiner_dim, vocab_size=vocab_size).to(device)
         logger.info(f"Initialized RNNT predictor+joiner with {model.enc_out_dim=} and {vocab_size=}.")
 
     # Setup loss function
@@ -552,7 +553,9 @@ if __name__ == "__main__":
     parser.add_argument("--max-grad-norm", type=float, default=5.0)
     parser.add_argument("--hidden-size", type=int, default=512)
     parser.add_argument("--num-layers", type=int, default=4)
-    parser.add_argument("--embedding-dim", type=int, default=128)
+    parser.add_argument("--rnnt-pred-emb-dim", type=int, default=64)
+    parser.add_argument("--rnnt-joiner-dim", type=int, default=64)
+    parser.add_argument("--input-proj-dim", type=int, default=-1)
     parser.add_argument("--num-heads", type=int, default=2)
     parser.add_argument("--num-blocks", type=int, default=3)
     parser.add_argument("--chunkwise-kernel", type=str, default="chunkwise--native_autograd")

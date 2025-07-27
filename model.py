@@ -5,26 +5,109 @@ import torchaudio
 from typing import Optional, Tuple, Any
 from xlstm.xlstm_large.model import xLSTMLargeConfig, xLSTMLarge
 
+def compute_loss(
+    mode: str,
+    criterion: nn.Module,
+    model: nn.Module,
+    feats: torch.Tensor,              # (B, T, F)
+    tokens: torch.Tensor,             # (B, U)
+    in_lens: torch.Tensor,            # (B,)
+    tgt_lens: torch.Tensor,           # (B,)
+    blank_id: int,
+    use_rnnt_joiner: Optional[nn.Module] = None,
+    input_state: Optional[Any] = None,
+    args=None
+) -> Tuple[torch.Tensor, Optional[Any]]:
+    """
+    Computes loss (CTC or RNN-T) given model, features, and labels.
+
+    Returns:
+        loss: scalar tensor
+        output_state: model's output state (for stateful models)
+    """
+    # Detach input state if present
+    if input_state:
+        input_state = detach_states(input_state)
+        if args and args.debug:
+            assert_all_detached(input_state)
+
+    # Forward pass through model
+    enc_out, output_state = model(feats, input_state)  # (B, T, D)
+
+    if mode == "ctc":
+        # CTC expects (T, B, V) after log_softmax
+        logp = enc_out.log_softmax(-1).transpose(0, 1)  # (T, B, V)
+        loss = criterion(logp, tokens, in_lens, tgt_lens)
+
+    elif mode == "rnnt":
+        assert use_rnnt_joiner is not None, "Joiner module required for RNN-T mode"
+
+        # Add blank token as prefix to labels for predictor input
+        blank_prefix = torch.full(
+            (tokens.size(0), 1),
+            blank_id,
+            dtype=tokens.dtype,
+            device=tokens.device
+        )
+        predictor_input = torch.cat([blank_prefix, tokens], dim=1)  # (B, U + 1)
+
+        # RNN-T joiner forward pass: logits shape (B, T, U+1, V)
+        logits = use_rnnt_joiner(enc_out, predictor_input)
+
+        # warp_rnnt expects float32
+        log_probs = logits.log_softmax(dim=-1)
+        if log_probs.dtype != torch.float32:
+            log_probs = log_probs.to(torch.float32)
+
+        # Labels for loss must be (B, U)
+        loss = criterion(
+            log_probs=log_probs,
+            labels=tokens,
+            frames_lengths=in_lens,
+            labels_lengths=tgt_lens,
+            blank=blank_id,
+            compact=True,
+            gather=True
+        )
+
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+
+    return loss, output_state, enc_out, output_state
+
 class RNNTPredictorJoiner(nn.Module):
-    """
-    Minimal RNN-T predictor+joiner:
-      - Embeds the label sequence (including blank prefix)
-      - Adds encoder and predictor embeddings
-      - Projects to vocab-size logits
-    """
-    def __init__(self, enc_dim: int, vocab_size: int):
+    def __init__(self, enc_out_dim: int, pred_emb_dim: int, join_dim: int, vocab_size: int, debug: bool=True):
         super().__init__()
-        self.embedding = nn.Embedding(vocab_size, enc_dim)
-        self.joiner = nn.Linear(enc_dim, vocab_size)
+        self.embedding = nn.Embedding(vocab_size, pred_emb_dim)
+
+        # Project encoder and predictor into shared join space
+        self.enc_proj = nn.Linear(enc_out_dim, join_dim)
+        self.pred_proj = nn.Linear(pred_emb_dim, join_dim)
+
+        self.debug=debug
+
+        if self.debug:
+            print(f"[DEBUG] RNNT pred init with {enc_out_dim=}, {pred_emb_dim=}, {join_dim=}, {vocab_size=}")
+
+        # Final projection to vocab logits
+        self.joiner = nn.Linear(join_dim, vocab_size)
 
     def forward(self, enc_out: torch.Tensor, prefix: torch.Tensor):
-        # enc_out: (B, T, enc_dim)
-        # prefix:  (B, U, enc_dim) via embedding
-        pred_emb = self.embedding(prefix)               # (B, U, enc_dim)
-        # broadcast sum
-        joint = enc_out.unsqueeze(2) + pred_emb.unsqueeze(1)  # (B, T, U, enc_dim)
+        
+        if self.debug:
+            print(f"[DEBUG] RNNT: {enc_out.shape=}")
+
+        # enc_out: (B, T, enc_out_dim)
+        # prefix:  (B, U)
+        pred_emb = self.embedding(prefix)           # (B, U, pred_emb_dim)
+
+        enc_proj = self.enc_proj(enc_out)           # (B, T, join_dim)
+        pred_proj = self.pred_proj(pred_emb)        # (B, U, join_dim)
+
+        # Broadcasted addition
+        joint = enc_proj.unsqueeze(2) + pred_proj.unsqueeze(1)  # (B, T, U, join_dim)
         joint = torch.tanh(joint)
-        logits = self.joiner(joint)                     # (B, T, U, V)
+        logits = self.joiner(joint)                 # (B, T, U, vocab_size)
         return logits
 
 
@@ -32,7 +115,7 @@ def build_encoder(args, vocab_size, feat_dim=80):
      if args.encoder == "lstm":
          # standard PyTorch LSTM
          return nn.LSTM(
-             input_size=args.embedding_dim if args.embedding_dim != -1 else feat_dim,
+             input_size=args.input_proj_dim if args.input_proj_dim != -1 else feat_dim,
              hidden_size=args.hidden_size,
              num_layers=args.num_layers,
              batch_first=True,
@@ -91,8 +174,9 @@ class ASRModel(nn.Module):
              self.encoder = encoder
              hidden = encoder.hidden_size
              bidi = encoder.bidirectional
-             self.enc_out_dim = hidden * (2 if bidi else 1)
-             self.classifier = nn.Linear(self.enc_out_dim, vocab_size)
+             self.rnn_out_dim = hidden * (2 if bidi else 1)
+             self.enc_out_dim = vocab_size
+             self.classifier = nn.Linear(self.rnn_out_dim, vocab_size)
              if proj_dim > 0:
                 self.proj = nn.Linear(feat_dim, proj_dim)
 
@@ -167,69 +251,4 @@ class ASRModel(nn.Module):
 
          return logits, new_states
 
-def compute_loss(
-    mode: str,
-    criterion: nn.Module,
-    model: nn.Module,
-    feats: torch.Tensor,              # (B, T, F)
-    tokens: torch.Tensor,             # (B, U)
-    in_lens: torch.Tensor,            # (B,)
-    tgt_lens: torch.Tensor,           # (B,)
-    blank_id: int,
-    use_rnnt_joiner: Optional[nn.Module] = None,
-    input_state: Optional[Any] = None,
-    args=None
-) -> Tuple[torch.Tensor, Optional[Any]]:
-    """
-    Computes loss (CTC or RNN-T) given model, features, and labels.
-
-    Returns:
-        loss: scalar tensor
-        output_state: model's output state (for stateful models)
-    """
-    # Detach input state if present
-    if input_state:
-        input_state = detach_states(input_state)
-        if args and args.debug:
-            assert_all_detached(input_state)
-
-    # Forward pass through model
-    enc_out, output_state = model(feats, input_state)  # (B, T, D)
-
-    if mode == "ctc":
-        # CTC expects (T, B, V) after log_softmax
-        logp = enc_out.log_softmax(-1).transpose(0, 1)  # (T, B, V)
-        loss = criterion(logp, tokens, in_lens, tgt_lens)
-
-    elif mode == "rnnt":
-        assert use_rnnt_joiner is not None, "Joiner module required for RNN-T mode"
-
-        # Add blank token as prefix to labels for predictor input
-        blank_prefix = torch.full(
-            (tokens.size(0), 1),
-            blank_id,
-            dtype=tokens.dtype,
-            device=tokens.device
-        )
-        predictor_input = torch.cat([blank_prefix, tokens], dim=1)  # (B, U + 1)
-
-        # RNN-T joiner forward pass: logits shape (B, T, U+1, V)
-        logits = use_rnnt_joiner(enc_out, predictor_input)
-
-        # warp_rnnt expects float32
-        log_probs = logits.log_softmax(dim=-1).to(torch.float32)
-
-        # Labels for loss must be (B, U)
-        loss = criterion(
-            log_probs=log_probs,
-            labels=tokens,
-            frames_lengths=in_lens,
-            labels_lengths=tgt_lens,
-            blank=blank_id
-        )
-
-    else:
-        raise ValueError(f"Unknown mode: {mode}")
-
-    return loss, output_state, enc_out, output_state
 
