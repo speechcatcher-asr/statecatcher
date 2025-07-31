@@ -8,9 +8,10 @@ Emerging recurrent architectures like [xLSTM](https://github.com/speechcatcher-a
 
 ## Key Features
 
-- Streaming data directly via HTTP(S) from [speechcatcher-data](https://github.com/speechcatcher-asr/speechcatcher-data) means compute and storage don’t have to reside on the same server.
-- Efficient use of TCP keep-alive avoids NFS-related I/O bottlenecks with many small files.
-- Enables distributed and scalable training setups with minimal storage constraints.
+- Uses modern recurrent networks such as xLSTMs and RWKV
+- CTC and RNN-T
+- Streaming training data directly via HTTP(S) from [speechcatcher-data](https://github.com/speechcatcher-asr/speechcatcher-data)
+- Enables distributed and scalable training setups with minimal storage constraints on a GPU server or cloud instance.
 
 ## Current Status (Work in Progress)
 
