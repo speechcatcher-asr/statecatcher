@@ -19,7 +19,7 @@ Emerging recurrent architectures like [xLSTM](https://github.com/speechcatcher-a
 | PyTorch dataset for speechcatcher-data | ✅ |
 | Training loop and batching | ✅ |
 | `nn.LSTM` | ✅ |
-| `xLSTM` ([repo](https://github.com/speechcatcher-asr/xlstm)) | ✅ |
+| `xLSTM` ([original](https://github.com/NX-AI/xlstm),[fork](https://github.com/speechcatcher-asr/xlstm)) | ✅ |
 | CTC (Connectionist Temporal Classification) loss | ✅ |
 | warp-transducer (RNN-T) | ⚠️ Needs more testing |
 | [Aim experiment tracking](https://github.com/aimhubio/aim) | ✅ |
