@@ -17,6 +17,7 @@ Emerging recurrent architectures like [xLSTM](https://github.com/speechcatcher-a
 | Component | Status |
 |----------|--------|
 | PyTorch dataset for speechcatcher-data | ✅ |
+| sentencepiece tokens | ✅ |
 | Training loop and batching | ✅ |
 | `nn.LSTM` | ✅ |
 | `xLSTM` ([original](https://github.com/NX-AI/xlstm),[fork](https://github.com/speechcatcher-asr/xlstm)) | ✅ |
