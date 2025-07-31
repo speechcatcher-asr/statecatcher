@@ -28,6 +28,7 @@ Emerging recurrent architectures like [xLSTM](https://github.com/speechcatcher-a
 | RWKV | 🔄 Planned/WiP |
 | Proper input masking | 🔄 Planned/WiP |
 | On-the-fly hallucination detection & filtering | 🔄 Planned/WiP |
+| Beam search decoder | 🔄 Planned/WiP |
 
 ## Roadmap
 
