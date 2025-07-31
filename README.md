@@ -4,7 +4,7 @@
 
 The primary goal is **stateful training**: long audio recordings (e.g. hour-long podcasts) are segmented for training. Crucially, between gradient updates, **model state is propagated** - the state of the model after processing one segment is used to initialize the next. This enables modeling **very long contexts** without overwhelming VRAM. It also allows to simplify decoding for streaming ASR.
 
-Emerging recurrent architectures like [xLSTM](https://github.com/speechcatcher-asr/xlstm) ([original fork](https://github.com/NX-AI/xlstm)) and [RWKV](https://www.rwkv.com/) - modern RNNs adapted for the transformer era - are likely ideal for this paradigm. See the paper [RWKV: Reinventing RNNs for the Transformer Era](https://arxiv.org/abs/2305.13048) for more background.
+Emerging recurrent architectures like [xLSTM](https://github.com/speechcatcher-asr/xlstm) ([original repo](https://github.com/NX-AI/xlstm), [fork](https://github.com/speechcatcher-asr/xlstm)) and [RWKV](https://www.rwkv.com/) - modern RNNs adapted for the transformer era - are likely ideal for this paradigm. See the paper [RWKV: Reinventing RNNs for the Transformer Era](https://arxiv.org/abs/2305.13048) for more background.
 
 ## Key Features
 
