@@ -140,7 +140,8 @@ class SpeechDataset:
         """Download one audio+VTT pair, split into fixed-length chunks, pad/trim,
         and return (audio_tensors, texts, masks)."""
         audio_url = item["cache_audio_url"]
-        transcript_url = item["transcript_file"].replace('/var/www/', 'https://')
+        transcript_url = item["transcript_file_url"] \
+                if "transcript_file_url" in item else item["transcript_file"].replace('/var/www/', 'https://')
 
         # 1) Download & decode audio
         try:
