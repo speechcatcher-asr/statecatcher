@@ -10,12 +10,13 @@ class LucyRNNConfig:
     vocab_size: int
     return_last_states: bool = True
     kernel_impl: str = "native"  # Options: 'native', 'triton'
+    is_training: bool = True      # Determines parallel vs sequential implementation
 
 class LucyRNNCell(nn.Module):
     def __init__(self, input_dim, hidden_dim):
         super().__init__()
         self.hidden_dim = hidden_dim
-        
+
         self.input_proj = nn.Linear(input_dim, hidden_dim)
 
         self.layernorm_in = nn.LayerNorm(hidden_dim)
@@ -49,7 +50,7 @@ class LucyRNNCell(nn.Module):
 
         k = self.W_k(u)
         v = self.W_v(u)
-        s = (self.pos_decay * s_prev) + (k * v)
+        s = (self.pos_decay.exp() * s_prev) + (k * v)
 
         c = torch.tanh(self.layernorm_h(self.W_h(u + s)))
 
@@ -68,7 +69,7 @@ class LucyRNN(nn.Module):
 
         if self.config.kernel_impl not in ["native", "triton"]:
             raise ValueError("kernel_impl must be either 'native' or 'triton'")
-        
+
         if self.config.kernel_impl == 'triton':
             raise NotImplementedError("Triton kernels not implemented yet.")
 
@@ -85,26 +86,55 @@ class LucyRNN(nn.Module):
         batch_size, seq_len, _ = x.size()
 
         if hidden_states is None:
-            h = [torch.zeros(batch_size, self.config.hidden_dim, device=x.device) 
+            h = [torch.zeros(batch_size, self.config.hidden_dim, device=x.device)
                  for _ in range(self.config.num_layers)]
             s = [torch.zeros(batch_size, self.config.hidden_dim, device=x.device)
                  for _ in range(self.config.num_layers)]
         else:
             h, s = hidden_states
 
-        outputs = []
-
-        for t in range(seq_len):
-            input_t = x[:, t, :]
-            mask_t = masks[:, t, :].unsqueeze(-1) if masks is not None else None
+        if self.config.is_training:
+            input_t = x.clone()
 
             for l, layer in enumerate(self.layers):
-                h[l], s[l] = layer(input_t, h[l], s[l], mask_t)
-                input_t = h[l]
+                u = layer.layernorm_in(layer.input_proj(input_t))
+                k = layer.W_k(u)
+                v = layer.W_v(u)
 
-            outputs.append(h[-1].unsqueeze(1))
+                kv = k * v
 
-        outputs = torch.cat(outputs, dim=1)
+                decay = layer.pos_decay.exp().view(1, 1, -1)
+                time_range = torch.arange(seq_len, device=x.device).view(1, seq_len, 1)
+                decay_factors = decay ** time_range
+
+                weighted_kv = kv * decay_factors
+                s_all = torch.cumsum(weighted_kv.flip(dims=[1]), dim=1).flip(dims=[1])
+
+                layer_output = torch.zeros(batch_size, seq_len, self.config.hidden_dim, device=x.device)
+                for t in range(seq_len):
+                    x_t = input_t[:, t, :]
+                    s_t = s_all[:, t, :]
+                    mask_t = masks[:, t, :].unsqueeze(-1) if masks is not None else None
+                    h[l], _ = layer(x_t, h[l], s_t, mask_t)
+                    layer_output[:, t, :] = h[l]
+
+                input_t = layer_output  # for next layer
+
+            outputs = input_t
+
+        else:
+            outputs = []
+            for t in range(seq_len):
+                input_t = x[:, t, :]
+                mask_t = masks[:, t, :].unsqueeze(-1) if masks is not None else None
+
+                for l, layer in enumerate(self.layers):
+                    h[l], s[l] = layer(input_t, h[l], s[l], mask_t)
+                    input_t = h[l]
+
+                outputs.append(h[-1].unsqueeze(1))
+
+            outputs = torch.cat(outputs, dim=1)
 
         logits = self.output_proj(outputs)
 
@@ -112,17 +142,4 @@ class LucyRNN(nn.Module):
             return logits, (h, s)
         else:
             return logits
-
-# Example instantiation of LucyRNNConfig
-lucyrnn_config = LucyRNNConfig(
-    input_dim=80,  # match this to your actual input feature dimension
-    hidden_dim=512,
-    num_layers=4,
-    vocab_size=1024,
-    return_last_states=True,
-    kernel_impl="native",  # use 'triton' when implemented
-)
-
-# Instantiate LucyRNN model
-lucyrnn = LucyRNN(lucyrnn_config).to("cuda")
 
