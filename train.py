@@ -33,32 +33,6 @@ except ImportError:
     HAVE_AIM = False
 
 
-def assert_all_detached(x):
-    if isinstance(x, torch.Tensor):
-        assert not x.requires_grad, "Tensor still requires grad"
-    elif isinstance(x, (list, tuple)):
-        for v in x:
-            assert_all_detached(v)
-    elif isinstance(x, dict):
-        for v in x.values():
-            assert_all_detached(v)
-
-def detach_states(states):
-    """Recursively detach all tensors in nested state structures (dicts, tuples, lists)."""
-    if states is None:
-        return None
-    elif isinstance(states, torch.Tensor):
-        return states.detach()
-    elif isinstance(states, dict):
-        return {k: detach_states(v) for k, v in states.items()}
-    elif isinstance(states, tuple):
-        return tuple(detach_states(s) for s in states)
-    elif isinstance(states, list):
-        return [detach_states(s) for s in states]
-    else:
-        # Catch any unexpected data type (e.g., numbers, strings)
-        return states
-
 def debug_print(debug, *args):
     """Helper function to print debug messages."""
     if debug:
@@ -529,7 +503,7 @@ if __name__ == "__main__":
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--sp-model", required=True, help="Path to SentencePiece model")
     parser.add_argument("--frontend", choices=["mfcc", "mel"], default="mfcc", help="Feature frontend")
-    parser.add_argument("--encoder", choices=["lstm", "xlstm"], default="lstm")
+    parser.add_argument("--encoder", choices=["lstm", "xlstm", "lucyrnn"], default="lstm")
     parser.add_argument("--batch-samplerate", type=int, default=16000)
     parser.add_argument("--batch-segment-strategy", choices=["clipping", "padding"], default="clipping")
     parser.add_argument("--batch-size", type=int, default=32)
