@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from dataclasses import dataclass
+from lucyrnn_triton import fused_decay_scan
 
 @dataclass
 class LucyRNNConfig:
@@ -29,8 +30,7 @@ class LucyRNNCell(nn.Module):
         self.W_k = nn.Linear(hidden_dim, hidden_dim)
         self.W_v = nn.Linear(hidden_dim, hidden_dim)
         self.W_h = nn.Linear(hidden_dim, hidden_dim)
-
-        self.pos_decay = nn.Parameter(torch.full((hidden_dim,), -0.1))
+        self.W_decay = nn.Linear(hidden_dim, hidden_dim)  # New learnable decay gate
 
         self.init_weights()
 
@@ -50,7 +50,9 @@ class LucyRNNCell(nn.Module):
 
         k = self.W_k(u)
         v = self.W_v(u)
-        s = (self.pos_decay.exp() * s_prev) + (k * v)
+
+        decay = torch.sigmoid(self.W_decay(u))  # Input-conditioned decay
+        s = decay * s_prev + (k * v)
 
         c = torch.tanh(self.layernorm_h(self.W_h(u + s)))
 
@@ -69,9 +71,6 @@ class LucyRNN(nn.Module):
 
         if self.config.kernel_impl not in ["native", "triton"]:
             raise ValueError("kernel_impl must be either 'native' or 'triton'")
-
-        if self.config.kernel_impl == 'triton':
-            raise NotImplementedError("Triton kernels not implemented yet.")
 
         self.layers = nn.ModuleList()
         for i in range(config.num_layers):
@@ -101,14 +100,26 @@ class LucyRNN(nn.Module):
                 k = layer.W_k(u)
                 v = layer.W_v(u)
 
+                decay = torch.sigmoid(layer.W_decay(u))
                 kv = k * v
 
-                decay = layer.pos_decay.exp().view(1, 1, -1)
-                time_range = torch.arange(seq_len, device=x.device).view(1, seq_len, 1)
-                decay_factors = decay ** time_range
-
-                weighted_kv = kv * decay_factors
-                s_all = torch.cumsum(weighted_kv.flip(dims=[1]), dim=1).flip(dims=[1])
+                if self.config.kernel_impl == 'triton':
+                    print("using triton kernel!")
+                    s_all = torch.empty_like(kv)
+                    B, T, D = kv.shape
+                    grid = (B, D)
+                    fused_decay_scan[grid](
+                        kv_ptr=kv, decay_ptr=decay, output_ptr=s_all,
+                        B=B, T=T, D=D,
+                        stride_b=T * D, stride_t=D, stride_d=1
+                    )
+                else:
+                    s_t = torch.zeros(batch_size, self.config.hidden_dim, device=x.device)
+                    s_all = []
+                    for t in range(seq_len):
+                        s_t = decay[:, t, :] * s_t + kv[:, t, :]
+                        s_all.append(s_t.unsqueeze(1))
+                    s_all = torch.cat(s_all, dim=1)
 
                 layer_output = torch.zeros(batch_size, seq_len, self.config.hidden_dim, device=x.device)
                 for t in range(seq_len):
