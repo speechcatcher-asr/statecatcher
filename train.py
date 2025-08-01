@@ -419,6 +419,7 @@ def train(args):
             else:
                 input_state = encoder_state
 
+            t_begin = time.time()
             # calculate loss (E.g. CTC or RNN-T)
             if args.use_scaler:
                 with autocast(device_type=device_str, dtype=torch.float16):
@@ -442,7 +443,10 @@ def train(args):
                     input_state=input_state, args=args)
                 loss = loss / args.accumulation_steps
                 loss.backward()
-           
+            t_end = time.time()
+
+            debug_print(args.debug, f"Model and loss computation for one batch took {t_end - t_begin:.2f}s")
+
             if HAVE_AIM:
                 run.track(loss.item(), name="loss", step=global_step)
 
