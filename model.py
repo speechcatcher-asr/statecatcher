@@ -196,7 +196,7 @@ class RNNTCompactPredictorJoiner(nn.Module):
     def forward(self, enc_out, prefix, in_lens, tgt_lens):
         return self.forward_compact(enc_out, prefix, in_lens, tgt_lens)
 
-def build_encoder(args, vocab_size, feat_dim=80):
+def build_encoder(args, vocab_size, feat_dim=80, is_training=True):
      if args.encoder == "lstm":
          # standard PyTorch LSTM
          return nn.LSTM(
@@ -232,7 +232,8 @@ def build_encoder(args, vocab_size, feat_dim=80):
              num_layers=args.num_layers,
              vocab_size=vocab_size,
              return_last_states=True,
-             kernel_impl="native",  # use 'triton' when implemented
+             kernel_impl="triton",  # use 'triton' when implemented
+             is_training=is_training
          )
          print("[DEBUG:] lucyrnn_config is:", lucyrnn_config)
          return lucyrnn_config
