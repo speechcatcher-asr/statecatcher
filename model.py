@@ -4,6 +4,33 @@ import torch.nn.functional as F
 import torchaudio
 from typing import Optional, Tuple, Any
 from xlstm.xlstm_large.model import xLSTMLargeConfig, xLSTMLarge
+from lucyrnn import LucyRNNConfig, LucyRNN
+
+def detach_states(states):
+    """Recursively detach all tensors in nested state structures (dicts, tuples, lists)."""
+    if states is None:
+        return None
+    elif isinstance(states, torch.Tensor):
+        return states.detach()
+    elif isinstance(states, dict):
+        return {k: detach_states(v) for k, v in states.items()}
+    elif isinstance(states, tuple):
+        return tuple(detach_states(s) for s in states)
+    elif isinstance(states, list):
+        return [detach_states(s) for s in states]
+    else:
+        # Catch any unexpected data type (e.g., numbers, strings)
+        return states
+
+def assert_all_detached(x):
+    if isinstance(x, torch.Tensor):
+        assert not x.requires_grad, "Tensor still requires grad"
+    elif isinstance(x, (list, tuple)):
+        for v in x:
+            assert_all_detached(v)
+    elif isinstance(x, dict):
+        for v in x.values():
+            assert_all_detached(v)
 
 def compute_loss(
     mode: str,
@@ -198,6 +225,17 @@ def build_encoder(args, vocab_size, feat_dim=80):
          )
          return cfg
 
+     elif args.encoder == "lucyrnn":
+         lucyrnn_config = LucyRNNConfig(
+             input_dim=args.input_proj_dim if args.input_proj_dim != -1 else feat_dim,
+             hidden_dim=args.hidden_size,
+             num_layers=args.num_layers,
+             vocab_size=vocab_size,
+             return_last_states=True,
+             kernel_impl="native",  # use 'triton' when implemented
+         )
+         print("[DEBUG:] lucyrnn_config is:", lucyrnn_config)
+         return lucyrnn_config
      else:
          raise ValueError(f"Unknown encoder type: {args.encoder!r}")
 
@@ -246,7 +284,13 @@ class ASRModel(nn.Module):
              self.input_seq_pad_factor = 64
              if proj_dim > 0:
                 self.proj = nn.Linear(feat_dim, proj_dim)
-
+         elif isinstance(encoder, LucyRNNConfig):
+             cfg = encoder
+             self.encoder = LucyRNN(cfg)
+             self.enc_out_dim = vocab_size
+             self.input_seq_pad_factor = 8
+             if proj_dim > 0:
+                self.proj = nn.Linear(feat_dim, proj_dim)
          else:
              raise ValueError(f"Unknown encoder provided: {type(encoder)}")
 
@@ -276,7 +320,7 @@ class ASRModel(nn.Module):
                  print(f"[DEBUG] After proj shape: {tuple(feats.shape)}")
          else:
              if self.debug:
-                 print(f"[DEBUG] Passing feats into LSTM with input dim {feats.size(-1)}")
+                 print(f"[DEBUG] Passing feats into RNN with input dim {feats.size(-1)}")
 
          # pad input sequence length if using xLSTM and sequence not divisible by 16 ---
          if isinstance(self.encoder, xLSTMLarge):
