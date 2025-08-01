@@ -12,11 +12,13 @@ class LucyRNNConfig:
     return_last_states: bool = True
     kernel_impl: str = "native"  # Options: 'native', 'triton'
     is_training: bool = True      # Determines parallel vs sequential implementation
+    fused_ops: bool = False       # Use fused linear projections
 
 class LucyRNNCell(nn.Module):
-    def __init__(self, input_dim, hidden_dim):
+    def __init__(self, input_dim, hidden_dim, fused_ops=False):
         super().__init__()
         self.hidden_dim = hidden_dim
+        self.fused_ops = fused_ops
 
         self.input_proj = nn.Linear(input_dim, hidden_dim)
 
@@ -25,12 +27,15 @@ class LucyRNNCell(nn.Module):
         self.layernorm_z = nn.LayerNorm(hidden_dim)
         self.layernorm_h = nn.LayerNorm(hidden_dim)
 
-        self.W_r = nn.Linear(hidden_dim, hidden_dim)
-        self.W_z = nn.Linear(hidden_dim, hidden_dim)
-        self.W_k = nn.Linear(hidden_dim, hidden_dim)
-        self.W_v = nn.Linear(hidden_dim, hidden_dim)
-        self.W_h = nn.Linear(hidden_dim, hidden_dim)
-        self.W_decay = nn.Linear(hidden_dim, hidden_dim)  # New learnable decay gate
+        if self.fused_ops:
+            self.W_fused = nn.Linear(hidden_dim, 6 * hidden_dim)
+        else:
+            self.W_r = nn.Linear(hidden_dim, hidden_dim)
+            self.W_z = nn.Linear(hidden_dim, hidden_dim)
+            self.W_k = nn.Linear(hidden_dim, hidden_dim)
+            self.W_v = nn.Linear(hidden_dim, hidden_dim)
+            self.W_h = nn.Linear(hidden_dim, hidden_dim)
+            self.W_decay = nn.Linear(hidden_dim, hidden_dim)
 
         self.init_weights()
 
@@ -45,16 +50,23 @@ class LucyRNNCell(nn.Module):
 
     def forward(self, x, h_prev, s_prev, mask=None):
         u = self.layernorm_in(self.input_proj(x))
-        r = torch.sigmoid(self.layernorm_r(self.W_r(u)))
-        z = torch.sigmoid(self.layernorm_z(self.W_z(u)))
 
-        k = self.W_k(u)
-        v = self.W_v(u)
-
-        decay = torch.sigmoid(self.W_decay(u))  # Input-conditioned decay
-        s = decay * s_prev + (k * v)
-
-        c = torch.tanh(self.layernorm_h(self.W_h(u + s)))
+        if self.fused_ops:
+            fused = self.W_fused(u)
+            r, z, k, v, h_pre, decay_logits = fused.chunk(6, dim=-1)
+            r = torch.sigmoid(self.layernorm_r(r))
+            z = torch.sigmoid(self.layernorm_z(z))
+            decay = torch.sigmoid(decay_logits)
+            s = decay * s_prev + (k * v)
+            c = torch.tanh(self.layernorm_h(h_pre + s))
+        else:
+            r = torch.sigmoid(self.layernorm_r(self.W_r(u)))
+            z = torch.sigmoid(self.layernorm_z(self.W_z(u)))
+            k = self.W_k(u)
+            v = self.W_v(u)
+            decay = torch.sigmoid(self.W_decay(u))
+            s = decay * s_prev + (k * v)
+            c = torch.tanh(self.layernorm_h(self.W_h(u + s)))
 
         h = (1 - z) * c + z * h_prev
 
@@ -75,7 +87,7 @@ class LucyRNN(nn.Module):
         self.layers = nn.ModuleList()
         for i in range(config.num_layers):
             layer_input_dim = config.input_dim if i == 0 else config.hidden_dim
-            self.layers.append(LucyRNNCell(layer_input_dim, config.hidden_dim))
+            self.layers.append(LucyRNNCell(layer_input_dim, config.hidden_dim, config.fused_ops))
 
         self.output_proj = nn.Linear(config.hidden_dim, config.vocab_size)
         nn.init.zeros_(self.output_proj.weight)
@@ -97,14 +109,19 @@ class LucyRNN(nn.Module):
 
             for l, layer in enumerate(self.layers):
                 u = layer.layernorm_in(layer.input_proj(input_t))
-                k = layer.W_k(u)
-                v = layer.W_v(u)
 
-                decay = torch.sigmoid(layer.W_decay(u))
+                if layer.fused_ops:
+                    fused = layer.W_fused(u)
+                    _, _, k, v, _, decay_logits = fused.chunk(6, dim=-1)
+                    decay = torch.sigmoid(decay_logits)
+                else:
+                    k = layer.W_k(u)
+                    v = layer.W_v(u)
+                    decay = torch.sigmoid(layer.W_decay(u))
+
                 kv = k * v
 
                 if self.config.kernel_impl == 'triton':
-                    print("using triton kernel!")
                     s_all = torch.empty_like(kv)
                     B, T, D = kv.shape
                     grid = (B, D)
