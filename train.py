@@ -304,6 +304,7 @@ def train(args):
 
     # Build and initialize the model
     model = build_model(args, device, feat_dim, vocab_size)
+    #model = torch.compile(model) #, fullgraph=True, mode="max-autotune")
     logger.info(f"Model built: {args.encoder}, feat_dim={feat_dim}, vocab_size={vocab_size}")
 
     if HAVE_AIM:
