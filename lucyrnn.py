@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from dataclasses import dataclass
-from lucyrnn_triton import fused_decay_scan, fused_rnn_forward, rnn_forward_unfused
+from lucyrnn_triton import fused_decay_scan, fused_rnn_forward, rnn_forward_unfused, rnn_forward_unfused_rmsnorm
 import torch.nn.functional as F
 
 @dataclass
@@ -38,7 +38,7 @@ class LucyRNNCellTriton(nn.Module):
         out = torch.empty(B, T, D, device=device, dtype=x.dtype)
         s_out = torch.empty(B, D, device=device, dtype=x.dtype)
 
-        rnn_forward_unfused[(B, D)](
+        rnn_forward_unfused_rmsnorm[(B, D)](
             gates_ptr=gates,
             h0_ptr=h0,
             s0_ptr=s0,
