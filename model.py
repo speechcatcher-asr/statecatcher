@@ -233,6 +233,9 @@ def build_encoder(args, vocab_size, feat_dim=80, is_training=True):
              vocab_size=vocab_size,
              return_last_states=True,
              kernel_impl="triton",  # use 'triton' when implemented
+             fused_ops=True,
+             stack_order=1,
+             layer_norm=False,
              is_training=is_training
          )
          print("[DEBUG:] lucyrnn_config is:", lucyrnn_config)
@@ -268,6 +271,7 @@ class ASRModel(nn.Module):
 
          # PyTorch LSTM encoder instance
          if isinstance(encoder, nn.LSTM):
+             self.cfg = None
              self.encoder = encoder
              hidden = encoder.hidden_size
              bidi = encoder.bidirectional
@@ -279,15 +283,15 @@ class ASRModel(nn.Module):
 
          # xLSTM config: instantiate projector + xLSTMLarge
          elif isinstance(encoder, xLSTMLargeConfig):
-             cfg = encoder
-             self.encoder = xLSTMLarge(cfg)
+             self.cfg = encoder
+             self.encoder = xLSTMLarge(self.cfg)
              self.enc_out_dim = vocab_size
              self.input_seq_pad_factor = 64
              if proj_dim > 0:
                 self.proj = nn.Linear(feat_dim, proj_dim)
          elif isinstance(encoder, LucyRNNConfig):
-             cfg = encoder
-             self.encoder = LucyRNN(cfg)
+             self.cfg = encoder
+             self.encoder = LucyRNN(self.cfg)
              self.enc_out_dim = vocab_size
              self.input_seq_pad_factor = 8
              if proj_dim > 0:
@@ -302,12 +306,6 @@ class ASRModel(nn.Module):
              print(f"[DEBUG] Input feats shape: {tuple(feats.shape)}")
              if states is None:
                 print(f"[DEBUG] states is None - initializing encoder with a new state.")
-
-         ## feats may come as (B, F, T) or (B, T, F); ensure (B, T, F)
-         #if feats.dim() == 3 and feats.size(1) > feats.size(2):
-         #    if self.debug:
-         #        print(f"[DEBUG] Transposing feats from (B,F,T) to (B,T,F)")
-         #    feats = feats.transpose(1, 2).contiguous()
 
          if self.debug:
              print(f"[DEBUG] Feats after transpose shape: {tuple(feats.shape)}")

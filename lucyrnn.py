@@ -13,21 +13,26 @@ class LucyRNNConfig:
     kernel_impl: str = "native"  # Options: 'native', 'triton'
     is_training: bool = True      # Determines parallel vs sequential implementation
     fused_ops: bool = False       # Use fused linear projections
+    layer_norm: bool = True       # Enable/disable LayerNorm for benchmarking
+    stack_order: int = 1          # Number of input frames to stack (e.g., 3 means [1,2,3], [4,5,6], ...)
 
 class LucyRNNCell(nn.Module):
-    def __init__(self, input_dim, hidden_dim, fused_ops=False):
+    def __init__(self, input_dim, hidden_dim, fused_ops=False, layer_norm=True):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.fused_ops = fused_ops
+        self.layer_norm = layer_norm
 
         self.input_proj = nn.Linear(input_dim, hidden_dim)
 
-        self.layernorm_in = nn.LayerNorm(hidden_dim)
-        self.layernorm_r = nn.LayerNorm(hidden_dim)
-        self.layernorm_z = nn.LayerNorm(hidden_dim)
-        self.layernorm_h = nn.LayerNorm(hidden_dim)
+        # Optional LayerNorms for benchmarking and normalization stability
+        self.layernorm_in = nn.LayerNorm(hidden_dim) if layer_norm else nn.Identity()
+        self.layernorm_r = nn.LayerNorm(hidden_dim) if layer_norm else nn.Identity()
+        self.layernorm_z = nn.LayerNorm(hidden_dim) if layer_norm else nn.Identity()
+        self.layernorm_h = nn.LayerNorm(hidden_dim) if layer_norm else nn.Identity()
 
         if self.fused_ops:
+            # Fused projection: 6x hidden_dim projected at once for efficiency
             self.W_fused = nn.Linear(hidden_dim, 6 * hidden_dim)
         else:
             self.W_r = nn.Linear(hidden_dim, hidden_dim)
@@ -44,9 +49,10 @@ class LucyRNNCell(nn.Module):
             if 'weight' in name and param.dim() > 1:
                 nn.init.orthogonal_(param)
 
-        for layernorm in [self.layernorm_in, self.layernorm_r, self.layernorm_z, self.layernorm_h]:
-            nn.init.constant_(layernorm.bias, 0)
-            nn.init.constant_(layernorm.weight, 1.0)
+        if self.layer_norm:
+            for layernorm in [self.layernorm_in, self.layernorm_r, self.layernorm_z, self.layernorm_h]:
+                nn.init.constant_(layernorm.bias, 0)
+                nn.init.constant_(layernorm.weight, 1.0)
 
     def forward(self, x, h_prev, s_prev, mask=None):
         u = self.layernorm_in(self.input_proj(x))
@@ -86,15 +92,28 @@ class LucyRNN(nn.Module):
 
         self.layers = nn.ModuleList()
         for i in range(config.num_layers):
-            layer_input_dim = config.input_dim if i == 0 else config.hidden_dim
-            self.layers.append(LucyRNNCell(layer_input_dim, config.hidden_dim, config.fused_ops))
+            if i == 0:
+                layer_input_dim = config.input_dim * config.stack_order  # stack adjustment
+            else:
+                layer_input_dim = config.hidden_dim
+            self.layers.append(LucyRNNCell(layer_input_dim, config.hidden_dim, config.fused_ops, config.layer_norm))
 
         self.output_proj = nn.Linear(config.hidden_dim, config.vocab_size)
         nn.init.zeros_(self.output_proj.weight)
         nn.init.zeros_(self.output_proj.bias)
 
     def forward(self, x, hidden_states=None, masks=None):
-        batch_size, seq_len, _ = x.size()
+        batch_size, seq_len, feat_dim = x.size()
+
+        # --- Frame Stacking Logic (for ASR speed-up) ---
+        if self.config.stack_order > 1:
+            stack = self.config.stack_order
+            trim_len = seq_len - (seq_len % stack)
+            x = x[:, :trim_len, :]
+            x = x.view(batch_size, trim_len // stack, feat_dim * stack)
+            if masks is not None:
+                masks = masks[:, :trim_len, :].view(batch_size, trim_len // stack, stack).all(dim=-1, keepdim=True)
+            seq_len = x.size(1)
 
         if hidden_states is None:
             h = [torch.zeros(batch_size, self.config.hidden_dim, device=x.device)
@@ -105,6 +124,7 @@ class LucyRNN(nn.Module):
             h, s = hidden_states
 
         if self.config.is_training:
+            # Parallel version using either native loop or Triton kernel
             input_t = x.clone()
 
             for l, layer in enumerate(self.layers):
@@ -122,6 +142,7 @@ class LucyRNN(nn.Module):
                 kv = k * v
 
                 if self.config.kernel_impl == 'triton':
+                    # Triton kernel for fast parallel scan: s_t = decay * s_{t-1} + kv
                     s_all = torch.empty_like(kv)
                     B, T, D = kv.shape
                     grid = (B, D)
@@ -131,6 +152,7 @@ class LucyRNN(nn.Module):
                         stride_b=T * D, stride_t=D, stride_d=1
                     )
                 else:
+                    # Native scan loop (still batched)
                     s_t = torch.zeros(batch_size, self.config.hidden_dim, device=x.device)
                     s_all = []
                     for t in range(seq_len):
@@ -138,6 +160,7 @@ class LucyRNN(nn.Module):
                         s_all.append(s_t.unsqueeze(1))
                     s_all = torch.cat(s_all, dim=1)
 
+                # Sequential application of RNN layer (depends on s_all)
                 layer_output = torch.zeros(batch_size, seq_len, self.config.hidden_dim, device=x.device)
                 for t in range(seq_len):
                     x_t = input_t[:, t, :]
@@ -151,6 +174,7 @@ class LucyRNN(nn.Module):
             outputs = input_t
 
         else:
+            # Sequential inference mode (step-by-step for autoregressive/stateful)
             outputs = []
             for t in range(seq_len):
                 input_t = x[:, t, :]

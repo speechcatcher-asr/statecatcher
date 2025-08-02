@@ -407,7 +407,18 @@ def train(args):
 
             tokens, tgt_lens = prepare_tokens_and_lengths(slice_texts, sp, blank_id, device)
             subsample = mask_tensor.size(1) // feats.size(1)
+
+            effective_stack = model.cfg.stack_order if model.cfg and hasattr(model.cfg, "stack_order") else 1
+            subsample = (mask_tensor.size(1) // feats.size(1)) * effective_stack
             in_lens = (mask_tensor.sum(dim=1) // subsample).clamp(max=feats.size(1)).long().tolist()
+
+            debug_print(args.debug, f"Subsample: {subsample}")
+
+            in_lens = (mask_tensor.sum(dim=1) // subsample).clamp(max=feats.size(1)).long().tolist()
+
+            for ilen, tlen in zip(in_lens, tgt_lens):
+                if ilen < tlen:
+                    logger.warning(f"Input length ({ilen}) < target length ({tlen}) — may cause CTC error")
 
             debug_print(args.debug, f"Output {subsample=} and {in_lens=}")
             debug_print(args.debug, f"Tokens shape: {tuple(tokens.shape)}")
