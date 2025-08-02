@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import torchaudio
 from typing import Optional, Tuple, Any
 from xlstm.xlstm_large.model import xLSTMLargeConfig, xLSTMLarge
-from lucyrnn import LucyRNNConfig, LucyRNN
+from lucyrnn import LucyRNNConfig, LucyRNN, LucyRNNtriton
 
 def detach_states(states):
     """Recursively detach all tensors in nested state structures (dicts, tuples, lists)."""
@@ -291,7 +291,7 @@ class ASRModel(nn.Module):
                 self.proj = nn.Linear(feat_dim, proj_dim)
          elif isinstance(encoder, LucyRNNConfig):
              self.cfg = encoder
-             self.encoder = LucyRNN(self.cfg)
+             self.encoder = LucyRNNtriton(self.cfg)
              self.enc_out_dim = vocab_size
              self.input_seq_pad_factor = 8
              if proj_dim > 0:
