@@ -13,11 +13,26 @@ from torch.amp import autocast, GradScaler
 import torch.nn.functional as F
 import torchaudio
 import sentencepiece as spm
+import multiprocessing
 import dataset
 from typing import Optional, Tuple, Any
 from jiwer import wer
 from model import make_frontend, ASRModel, build_encoder, RNNTPredictorJoiner, RNNTCompactPredictorJoiner, compute_loss
 from decoder import ctc_greedy_decoder
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+_worker_ds = None
+
+# for process pooling
+def init_worker(args):
+    global _worker_ds
+    _worker_ds = dataset.SpeechDataset(
+        config_path=args.config,
+        verbose=args.verbose,
+        debug_spectrograms=False,
+        batch_segment_strategy=args.batch_segment_strategy,
+        batch_samplerate=args.batch_samplerate
+    )
 
 # Try to import RNN-T loss; if unavailable, only CTC will work
 try:
@@ -160,8 +175,9 @@ def setup_dataset(args):
 
 def process_batch_item(ds, item, target_samples):
     """Process a single batch item and handle any preprocessing errors."""
+    global _worker_ds
     try:
-        audios, texts, masks = ds._load_and_preprocess_batch_item(item, target_samples)
+        audios, texts, masks = _worker_ds.load_and_preprocess_batch_item(item, target_samples)
         return audios, texts, masks
     except Exception as e:
         logging.getLogger("train").error(f"Data preprocess error: {e}; trying to leave out batch item!")
@@ -266,8 +282,17 @@ def save_checkpoint(model_dir, model, joiner, epoch, global_step=None, logger=No
 
     return ckpt_path
 
+def process_batch_item_wrapper(args):
+    global _worker_ds
+    item, target_samples = args
+    try:
+        audios, texts, masks = _worker_ds.load_and_preprocess_batch_item(item, target_samples)
+        return audios, texts, masks
+    except Exception as e:
+        logging.getLogger("train").error(f"Data preprocess error: {e}; trying to leave out batch item!")
+        return None
 
-def train(args):
+def train(args, executer=None):
     """Main training function."""
     
     # Setup model directory and logging
@@ -357,12 +382,15 @@ def train(args):
 
     # Main training loop
     while True:
+        t_begin = time.time()
         try:
             epoch, batch_id, batch = ds.fetch_next_batch()
         except Exception as e:
             logger.error(f"Data fetch error in fetch_next_batch(): {e}; sleeping for 10 seconds before retrying!")
             time.sleep(10)
             continue
+        t_end = time.time()
+        debug_print(args.debug, f"ds.fetch_next_batch() took {t_end - t_begin:.2f}s")
 
         # save model after every epoch
         if prev_epoch is None:
@@ -376,15 +404,30 @@ def train(args):
         if epoch >= args.epochs:
             break
 
+        t_begin = time.time()
         batch_audio_items, batch_texts_items, batch_masks_items = [], [], []
-        for item in batch:
-            result = process_batch_item(ds, item, target_samples)
-            if result:
-                audios, texts, masks = result
-                batch_audio_items.append(audios)
-                batch_texts_items.append(texts)
-                batch_masks_items.append(masks)
 
+        if executor:
+            futures = [executor.submit(process_batch_item_wrapper, (item, target_samples))
+                        for item in batch]
+            results = [f.result() for f in futures]
+        else:
+            results = [ds.load_and_preprocess_batch_item(item, target_samples) for item in batch]
+
+        for result in results:
+            if result:
+                audio_np_list, text_list, mask_np_list = result
+
+                audio_tensor_list = [torch.from_numpy(arr) for arr in audio_np_list]
+                mask_tensor_list  = [torch.from_numpy(arr) for arr in mask_np_list]
+
+                batch_audio_items.append(audio_tensor_list)
+                batch_texts_items.append(text_list)
+                batch_masks_items.append(mask_tensor_list)
+
+        t_end = time.time()
+        debug_print(args.debug, f"Process batch items took {t_end - t_begin:.2f}s")
+       
         if not batch_audio_items:
             logger.error("Batch is empty, probably due to previous errors. Retrying with a new batch after one second.")
             time.sleep(1)
@@ -392,6 +435,8 @@ def train(args):
 
         seg_counts = [len(segs) for segs in batch_audio_items]
         K = min(seg_counts) if ds.batch_segment_strategy == "clipping" else max(seg_counts)
+
+        debug_print(args.debug, f"Prepare batch with {K} segments. ds.batch_segment_strategy is {ds.batch_segment_strategy}.")
 
         encoder_state = None
         for seg_idx in range(K):
@@ -468,9 +513,14 @@ def train(args):
 
             debug_print(args.debug, f"Model and loss computation for one batch took {t_end - t_begin:.2f}s")
 
+            t_begin = time.time()
             if HAVE_AIM:
                 run.track(loss.item(), name="loss", step=global_step)
+            t_end = time.time()
 
+            debug_print(args.debug, f"Run AIM track took {t_end - t_begin:.2f}s")
+
+            t_begin = time.time()
             if (global_step + 1) % args.accumulation_steps == 0:
                 if scaler is not None:
                     scaler.unscale_(optimizer)
@@ -494,6 +544,9 @@ def train(args):
                     scheduler.step()
 
                 optimizer.zero_grad()
+            t_end = time.time()
+
+            debug_print(args.debug, f"Optimizer step took {t_end - t_begin:.2f}s")
 
             # Save model every n updates
             if args.save_every_n_updates is not None and (global_step + 1) % args.save_every_n_updates == 0:
@@ -502,8 +555,11 @@ def train(args):
             encoder_state = output_state
             global_step += 1
 
+            t_begin = time.time()
             # log train losses every 10 steps, compute TER 
             losses = log_train_metrics(args, run, logger, losses + [loss.item()], enc_out, tokens, tgt_lens, in_lens, sp, blank_id, global_step)
+            t_end = time.time()
+            debug_print(args.debug, f"Log train metrics took {t_end - t_begin:.2f}s")
 
             if args.steps and global_step >= args.steps:
                 break
@@ -563,6 +619,9 @@ if __name__ == "__main__":
     parser.add_argument("--sequence-kernel", type=str, default="native_sequence__native")
     parser.add_argument("--step-kernel", type=str, default="native")
     parser.add_argument("--save-every-n-updates", type=int, default=None, help="Save model every n updates")
+    parser.add_argument("--num-workers", type=int, default=32,
+        help="Number of parallel workers for batch item processing. Set to -1 to disable multiprocessing.")
+
     # with triton:
     #parser.add_argument("--chunkwise-kernel", type=str, default="chunkwise--triton_xl_chunk")
     #parser.add_argument("--sequence-kernel", type=str, default="native_sequence__triton")
@@ -575,5 +634,18 @@ if __name__ == "__main__":
     if args.debug:
         torch.autograd.set_detect_anomaly(True)
 
-    train(args)
+    ctx = multiprocessing.get_context("spawn") 
+    executor = None
+    if args.num_workers > 0:
+        executor = ProcessPoolExecutor(
+            max_workers=args.num_workers,
+            initializer=init_worker,
+            initargs=(args,),
+            mp_context=ctx
+        )
 
+    try:
+        train(args, executor)
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True)

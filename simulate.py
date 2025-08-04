@@ -31,7 +31,7 @@ def simulate_training_loop(ds, steps=None, sleep=1.0, target_duration=30.0):
 
         for item in batch:
             try:
-                audios, texts, masks = ds._load_and_preprocess_batch_item(item, target_samples)
+                audios, texts, masks = ds.load_and_preprocess_batch_item(item, target_samples)
                 ds._vprint(f"Item segments: {[a.shape for a in audios]}")
                 batch_audio_items.append(audios)
                 batch_texts_items.append(texts)

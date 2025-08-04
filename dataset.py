@@ -136,7 +136,7 @@ class SpeechDataset:
         except Exception:
             pass
 
-    def _load_and_preprocess_batch_item(self, item, target_samples):
+    def load_and_preprocess_batch_item(self, item, target_samples):
         """Download one audio+VTT pair, split into fixed-length chunks, pad/trim,
         and return (audio_tensors, texts, masks)."""
         audio_url = item["cache_audio_url"]
@@ -175,6 +175,7 @@ class SpeechDataset:
         except Exception as e:
             raise RuntimeError(f"Failed to fetch/parse transcript: {e}")
 
+        self._vprint(f"Done! Now chunking to target duration...")
         # 3) Group VTT cues into “chunks” near target_duration
         chunks = []
         cur = []            # list of (start,end,text)
@@ -209,48 +210,60 @@ class SpeechDataset:
             s0, e0, _ = cur[0]
             chunks.append((s0, cur[-1][1], [t for _, _, t in cur]))
 
+        self._vprint(f"Done! I have {len(chunks)} chunks, target_samples is: {target_samples}.")
+        self._vprint(f"Now converting into fixed-size audio + mask + joined text...")
+
         # 4) Convert each chunk into fixed-size audio + mask + joined text
-        segment_tensors = []
-        segment_texts = []
-        segment_masks = []
+        segment_arrays = []   # numpy arrays for audio
+        segment_texts  = []
+        segment_masks  = []   # numpy boolean arrays
 
         for (c_start, c_end, texts) in chunks:
+            self._vprint(f"{c_start=}, {c_end=}")
             s_samp = int(c_start * sr)
             e_samp = int(c_end * sr)
             seg = audio_float[s_samp:e_samp]
             real_len = len(seg)
 
+            self._vprint(f"{real_len=}, {target_samples=}")
+
             if real_len >= target_samples:
                 # too long -> trim
                 seg = seg[:target_samples]
-                mask = torch.ones(target_samples, dtype=torch.bool)
+                mask = np.ones(target_samples, dtype=bool)
             else:
                 # too short -> pad zeros
                 pad = target_samples - real_len
                 pad_arr = np.zeros(pad, dtype=np.float32)
                 seg = np.concatenate([seg, pad_arr], axis=0)
-                mask = torch.cat([
-                    torch.ones(real_len, dtype=torch.bool),
-                    torch.zeros(pad,    dtype=torch.bool)
-                ], dim=0)
+                mask = np.concatenate([
+                    np.ones(real_len, dtype=bool),
+                    np.zeros(pad,    dtype=bool)
+                ], axis=0)
 
-            segment_tensors.append(torch.from_numpy(seg))
+            self._vprint(f"Appending...")
+
+            segment_arrays.append(seg)
             segment_masks.append(mask)
             segment_texts.append(" ".join(texts))
 
         # 5) If *no* chunks found (e.g. totally empty VTT), fall back to zero-pad + empty text
-        if not segment_tensors:
+        if not segment_arrays:
             seg = audio_float
             real_len = min(len(seg), target_samples)
             pad_len = target_samples - real_len
             seg = np.concatenate([seg[:real_len], np.zeros(pad_len, dtype=np.float32)])
-            mask = torch.cat([torch.ones(real_len, dtype=torch.bool),
-                              torch.zeros(pad_len,  dtype=torch.bool)])
-            segment_tensors = [torch.from_numpy(seg)]
-            segment_masks   = [mask]
-            segment_texts   = [""]
+            mask = np.concatenate([
+                np.ones(real_len, dtype=bool),
+                np.zeros(pad_len,  dtype=bool)
+            ])
+            segment_arrays = [seg]
+            segment_masks  = [mask]
+            segment_texts  = [""]
 
-        return segment_tensors, segment_texts, segment_masks
+        self._vprint(f"prepare item finished!")
+
+        return segment_arrays, segment_texts, segment_masks
 
     def _plot_batch_waveforms(self, batch_audio, batch_texts, epoch, batch_id, seg_idx):
         """
