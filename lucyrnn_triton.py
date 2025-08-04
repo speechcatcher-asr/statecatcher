@@ -78,21 +78,31 @@ class LucyRNNtriton(nn.Module):
     def __init__(self, config: LucyRNNConfig):
         super().__init__()
         assert config.fused_ops
-        assert not config.layer_norm  # your config disables per-gate LN
+        assert not config.layer_norm
         assert config.stack_order == 1
         assert config.decay_mode == 'learned'
 
         self.config = config
-        self.layers = nn.ModuleList()
+        self.num_tracks = getattr(config, "num_tracks", 1)
+
+        self.tracks = nn.ModuleList()
         self.norms = nn.ModuleList()
+        for t in range(self.num_tracks):
+            layers = nn.ModuleList()
+            norms = nn.ModuleList()
+            for i in range(config.num_layers):
+                input_dim = config.input_dim if i == 0 else config.hidden_dim
+                layers.append(LucyRNNCellTriton(input_dim, config.hidden_dim))
+                if i < config.num_layers - 1:
+                    norms.append(nn.LayerNorm(config.hidden_dim))
+            self.tracks.append(layers)
+            self.norms.append(norms)
 
-        for i in range(config.num_layers):
-            input_dim = config.input_dim if i == 0 else config.hidden_dim
-            self.layers.append(LucyRNNCellTriton(input_dim, config.hidden_dim))
-
-            # Add LayerNorm after each layer *except the last*
-            if i < config.num_layers - 1:
-                self.norms.append(nn.LayerNorm(config.hidden_dim))
+        self.merge_proj = (
+            nn.Identity()
+            if self.num_tracks == 1
+            else LinearSafe(config.hidden_dim * self.num_tracks, config.hidden_dim)
+        )
 
         self.output_proj = LinearSafe(config.hidden_dim, config.vocab_size)
         nn.init.zeros_(self.output_proj.weight)
@@ -102,30 +112,48 @@ class LucyRNNtriton(nn.Module):
         B, T, _ = x.shape
         dtype = x.dtype
         device = x.device
+        L = self.config.num_layers
+        H = self.config.hidden_dim
 
         if hidden_states is None:
-            h = [torch.zeros(B, self.config.hidden_dim, device=device, dtype=dtype)
-                 for _ in range(self.config.num_layers)]
-            s = [torch.zeros(B, self.config.hidden_dim, device=device, dtype=dtype)
-                 for _ in range(self.config.num_layers)]
+            h = [[torch.zeros(B, H, device=device, dtype=dtype) for _ in range(L)] for _ in range(self.num_tracks)]
+            s = [[torch.zeros(B, H, device=device, dtype=dtype) for _ in range(L)] for _ in range(self.num_tracks)]
         else:
             h, s = hidden_states
 
-        for l, layer in enumerate(self.layers):
-            x, s[l] = layer(x, h[l], s[l])
-            h[l] = x[:, -1, :]
+        track_outputs = []
+        final_h = []
+        final_s = []
 
-            # Apply LayerNorm after each layer except the last
-            if l < self.config.num_layers - 1:
-                x = self.norms[l](x)
+        for t in range(self.num_tracks):
+            x_t = x
+            h_t, s_t = h[t], s[t]
+            layers = self.tracks[t]
+            norms = self.norms[t]
+            for l, layer in enumerate(layers):
+                x_t, s_t[l] = layer(x_t, h_t[l], s_t[l])
+                h_t[l] = x_t[:, -1, :]
+                if l < len(norms):
+                    x_t = norms[l](x_t)
+            track_outputs.append(x_t)
+            final_h.append(h_t)
+            final_s.append(s_t)
+
+        # Merge across tracks
+        if self.num_tracks == 1:
+            x = track_outputs[0]
+        else:
+            x = torch.cat(track_outputs, dim=-1)
+            x = self.merge_proj(x)
 
         x = x.contiguous()
         logits = self.output_proj(x)
 
         if self.config.return_last_states:
-            return logits, (h, s)
+            return logits, (final_h, final_s)
         else:
             return logits
+
 
 @triton.jit
 def fused_decay_scan(
