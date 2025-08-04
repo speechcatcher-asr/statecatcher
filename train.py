@@ -212,10 +212,10 @@ def prepare_tokens_and_lengths(slice_texts, sp, blank_id, device):
     return tokens, tgt_lens
 
 def log_train_metrics(
-    args, run, logger, losses, enc_out, tokens, tgt_lens, in_lens, sp, blank_id, global_step
+    args, run, logger, losses, enc_out, tokens, tgt_lens, in_lens, sp, blank_id, global_step, avg_over_n_steps=100
 ):
     losses.append(float(losses[-1]))
-    if len(losses) < 10:
+    if len(losses) < avg_over_n_steps:
         return losses
 
     avg_loss = sum(losses) / len(losses)
@@ -253,8 +253,8 @@ def log_train_metrics(
         ter = -1.0
 
     if run is not None:
-        run.track(avg_loss, name="avg_loss_10", step=global_step)
-        run.track(ter, name="train_ter_10", step=global_step)
+        run.track(avg_loss, name=f"avg_loss_{avg_over_n_steps}", step=global_step)
+        run.track(ter, name=f"train_ter_{avg_over_n_steps}", step=global_step)
 
     logger.info(f"[Step {global_step}] Loss: {avg_loss:.4f}, Train TER: {ter:.4f}")
 
