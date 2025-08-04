@@ -1,6 +1,7 @@
 import triton
 import triton.language as tl
 import torch
+import torch.nn.functional as F
 from lucyrnn_conf import LucyRNNConfig
 import torch.nn as nn
 
@@ -9,12 +10,14 @@ class LinearSafe(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
         self.bias = nn.Parameter(torch.empty(out_features)) if bias else None
-        nn.init.zeros_(self.weight)
-        if bias:
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.weight)
+        if self.bias is not None:
             nn.init.zeros_(self.bias)
 
     def forward(self, x):
-        # Works with x of shape (B*T, D) or (B, T, D)
         x_flat = x.view(-1, x.shape[-1]).contiguous()
         out = torch.matmul(x_flat, self.weight.T)
         if self.bias is not None:
@@ -27,6 +30,22 @@ class LucyRNNCellTriton(nn.Module):
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.linear = LinearSafe(input_dim, 6 * hidden_dim)
+        self._init_weights()
+
+    def _init_weights(self):
+        # Xavier init for weight
+        nn.init.xavier_uniform_(self.linear.weight)
+
+        # Gate-aware bias init
+        if self.linear.bias is not None:
+            D = self.hidden_dim
+            with torch.no_grad():
+                self.linear.bias[0*D:1*D].zero_()       # r gate
+                self.linear.bias[1*D:2*D].fill_(1.0)    # z gate
+                self.linear.bias[2*D:3*D].zero_()       # k
+                self.linear.bias[3*D:4*D].zero_()       # v
+                self.linear.bias[4*D:5*D].zero_()       # h_pre
+                self.linear.bias[5*D:6*D].fill_(2.0)    # decay
 
     def forward(self, x, h0, s0):
         B, T, _ = x.shape
@@ -60,16 +79,21 @@ class LucyRNNtriton(nn.Module):
     def __init__(self, config: LucyRNNConfig):
         super().__init__()
         assert config.fused_ops
-        assert not config.layer_norm
+        assert not config.layer_norm  # your config disables per-gate LN
         assert config.stack_order == 1
         assert config.decay_mode == 'learned'
 
         self.config = config
         self.layers = nn.ModuleList()
+        self.norms = nn.ModuleList()
 
         for i in range(config.num_layers):
             input_dim = config.input_dim if i == 0 else config.hidden_dim
             self.layers.append(LucyRNNCellTriton(input_dim, config.hidden_dim))
+
+            # Add LayerNorm after each layer *except the last*
+            if i < config.num_layers - 1:
+                self.norms.append(nn.LayerNorm(config.hidden_dim))
 
         self.output_proj = LinearSafe(config.hidden_dim, config.vocab_size)
         nn.init.zeros_(self.output_proj.weight)
@@ -92,9 +116,11 @@ class LucyRNNtriton(nn.Module):
             x, s[l] = layer(x, h[l], s[l])
             h[l] = x[:, -1, :]
 
-        # F.linear() expects proper contiguous layout for batched matmul - triton may not produce that
-        x = x.contiguous()
+            # Apply LayerNorm after each layer except the last
+            if l < self.config.num_layers - 1:
+                x = self.norms[l](x)
 
+        x = x.contiguous()
         logits = self.output_proj(x)
 
         if self.config.return_last_states:
@@ -157,25 +183,31 @@ def rnn_forward_unfused_rmsnorm(
         h_pre = tl.load(gates_ptr + b * stride_g_bt + t * stride_g_td + 4 * stride_g_cd + d)
         decay = tl.load(gates_ptr + b * stride_g_bt + t * stride_g_td + 5 * stride_g_cd + d)
 
-        # ---------- RMSNorm over gates at this (b, t, d) ----------
-        # rms = sqrt(mean([r, z, k, v, h_pre, decay]^2))
-        sum_squares = r * r + z * z + k * k + v * v + h_pre * h_pre + decay * decay
-        rms = tl.sqrt(sum_squares / 6 + 1e-6)
+        # ---------- Grouped RMSNorm ----------
+        rms_control = tl.sqrt((r*r + z*z) / 2 + 1e-6)
+        rms_kv = tl.sqrt((k*k + v*v) / 2 + 1e-6)
+        rms_decay = tl.sqrt(decay*decay + 1e-6)
+        rms_h = tl.sqrt(h_pre*h_pre + 1e-6)
 
-        # Normalize
-        r /= rms
-        z /= rms
-        k /= rms
-        v /= rms
-        h_pre /= rms
-        decay /= rms
+        r /= rms_control
+        z /= rms_control
+        decay /= rms_decay
 
-        # Apply nonlinearities
+        k /= rms_kv
+        v /= rms_kv
+
+        h_pre /= rms_h
+        # --------------------------------------
+
+        # Nonlinearities
         r = tl.sigmoid(r)
         z = tl.sigmoid(z)
         decay = tl.sigmoid(decay)
 
-        kv = k * v
+        # Bounded kv update
+        kv = (k * v) / (rms_kv * rms_kv + 1e-6)
+
+        # Memory and hidden update
         s = decay * s + kv
         c = tl.sigmoid(2 * (h_pre + s)) * 2.0 - 1.0
         h = (1. - z) * c + z * h
@@ -183,6 +215,3 @@ def rnn_forward_unfused_rmsnorm(
         tl.store(out_ptr + b * stride_o_bt + t * stride_o_bd + d, h)
 
     tl.store(s_out_ptr + b * D + d, s)
-
-
-

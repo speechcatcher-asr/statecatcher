@@ -414,6 +414,10 @@ def train(args, executer=None):
         else:
             results = [ds.load_and_preprocess_batch_item(item, target_samples) for item in batch]
 
+        t_end = time.time()
+        debug_print(args.debug, f"Process batch items took {t_end - t_begin:.2f}s")
+
+        t_begin = time.time()
         for result in results:
             if result:
                 audio_np_list, text_list, mask_np_list = result
@@ -424,10 +428,10 @@ def train(args, executer=None):
                 batch_audio_items.append(audio_tensor_list)
                 batch_texts_items.append(text_list)
                 batch_masks_items.append(mask_tensor_list)
-
         t_end = time.time()
-        debug_print(args.debug, f"Process batch items took {t_end - t_begin:.2f}s")
-       
+
+        debug_print(args.debug, f"Iterating of results took: {t_end - t_begin:.2f}s")
+
         if not batch_audio_items:
             logger.error("Batch is empty, probably due to previous errors. Retrying with a new batch after one second.")
             time.sleep(1)
