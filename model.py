@@ -4,7 +4,9 @@ import torch.nn.functional as F
 import torchaudio
 from typing import Optional, Tuple, Any
 from xlstm.xlstm_large.model import xLSTMLargeConfig, xLSTMLarge
-from lucyrnn import LucyRNNConfig, LucyRNN, LucyRNNtriton
+from lucyrnn import LucyRNN
+from lucyrnn_conf import LucyRNNConfig
+from lucyrnn_triton import LucyRNNtriton
 
 def detach_states(states):
     """Recursively detach all tensors in nested state structures (dicts, tuples, lists)."""

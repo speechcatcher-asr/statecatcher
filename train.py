@@ -395,19 +395,28 @@ def train(args):
 
         encoder_state = None
         for seg_idx in range(K):
+            t_begin = time.time() 
             batch_tensor, mask_tensor, slice_texts = prepare_batch_data(
                 batch_audio_items, batch_texts_items, batch_masks_items, seg_idx, target_samples, device
             )
+            t_end = time.time()
+            debug_print(args.debug, f"Prepare_batch_data took {t_end - t_begin:.2f}s")
 
             debug_print(args.debug, f"Batch shape: {tuple(batch_tensor.shape)}")
             debug_print(args.debug, f"Mask shape: {tuple(mask_tensor.shape)}")
 
+            t_begin = time.time()
             with torch.no_grad():
                 feats = frontend(batch_tensor)
             feats = feats.transpose(1, 2).contiguous()
+            t_end = time.time()
+            debug_print(args.debug, f"Applying frontend took {t_end - t_begin:.2f}s")
 
+            t_begin = time.time()
             tokens, tgt_lens = prepare_tokens_and_lengths(slice_texts, sp, blank_id, device)
             subsample = mask_tensor.size(1) // feats.size(1)
+            t_end = time.time()
+            debug_print(args.debug, f"Prepare_tokens_and_lengths took {t_end - t_begin:.2f}s")
 
             effective_stack = model.cfg.stack_order if model.cfg and hasattr(model.cfg, "stack_order") else 1
             subsample = (mask_tensor.size(1) // feats.size(1)) * effective_stack
@@ -542,7 +551,7 @@ if __name__ == "__main__":
     parser.add_argument("--warmup-steps", type=int, default=10000)
     parser.add_argument("--total-steps", type=int, default=100000)
     parser.add_argument("--accumulation-steps", type=int, default=1)
-    parser.add_argument("--max-grad-norm", type=float, default=5.0)
+    parser.add_argument("--max-grad-norm", type=float, default=50.0)
     parser.add_argument("--hidden-size", type=int, default=512)
     parser.add_argument("--num-layers", type=int, default=4)
     parser.add_argument("--rnnt-pred-emb-dim", type=int, default=64)
