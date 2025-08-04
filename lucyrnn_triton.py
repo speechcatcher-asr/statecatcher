@@ -29,14 +29,13 @@ class LucyRNNCellTriton(nn.Module):
         super().__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
-        self.linear = LinearSafe(input_dim, 6 * hidden_dim)
+        self.linear = LinearSafe(input_dim, 7 * hidden_dim)  # 7 gates
         self._init_weights()
 
     def _init_weights(self):
-        # Xavier init for weight
+        # Xavier init
         nn.init.xavier_uniform_(self.linear.weight)
-
-        # Gate-aware bias init
+        # Gate-aware bias inits
         if self.linear.bias is not None:
             D = self.hidden_dim
             with torch.no_grad():
@@ -46,15 +45,15 @@ class LucyRNNCellTriton(nn.Module):
                 self.linear.bias[3*D:4*D].zero_()       # v
                 self.linear.bias[4*D:5*D].zero_()       # h_pre
                 self.linear.bias[5*D:6*D].fill_(2.0)    # decay
+                self.linear.bias[6*D:7*D].fill_(0.5)    # alpha gate
 
     def forward(self, x, h0, s0):
         B, T, _ = x.shape
         D = self.hidden_dim
         device = x.device
 
-        # Precompute gates: shape [B, T, 6 * D]
-        gates = self.linear(x)
-        gates = gates.view(B, T, 6, D).contiguous()
+        # Compute gates: [B, T, 7 * D]
+        gates = self.linear(x).view(B, T, 7, D).contiguous()
 
         out = torch.empty(B, T, D, device=device, dtype=x.dtype)
         s_out = torch.empty(B, D, device=device, dtype=x.dtype)
@@ -151,7 +150,7 @@ def fused_decay_scan(
 
 @triton.jit
 def rnn_forward_unfused_rmsnorm(
-    gates_ptr,  # [B, T, 6, D] flattened
+    gates_ptr,  # [B, T, 7, D] flattened
     h0_ptr,     # [B, D]
     s0_ptr,     # [B, D]
     out_ptr,    # [B, T, D]
@@ -175,43 +174,44 @@ def rnn_forward_unfused_rmsnorm(
     s = tl.load(s0_ptr + b * D + d)
 
     for t in range(T):
-        # Load gates
         r = tl.load(gates_ptr + b * stride_g_bt + t * stride_g_td + 0 * stride_g_cd + d)
         z = tl.load(gates_ptr + b * stride_g_bt + t * stride_g_td + 1 * stride_g_cd + d)
         k = tl.load(gates_ptr + b * stride_g_bt + t * stride_g_td + 2 * stride_g_cd + d)
         v = tl.load(gates_ptr + b * stride_g_bt + t * stride_g_td + 3 * stride_g_cd + d)
         h_pre = tl.load(gates_ptr + b * stride_g_bt + t * stride_g_td + 4 * stride_g_cd + d)
         decay = tl.load(gates_ptr + b * stride_g_bt + t * stride_g_td + 5 * stride_g_cd + d)
+        alpha = tl.load(gates_ptr + b * stride_g_bt + t * stride_g_td + 6 * stride_g_cd + d)
 
-        # ---------- Grouped RMSNorm ----------
+        # Grouped RMSNorm
         rms_control = tl.sqrt((r*r + z*z) / 2 + 1e-6)
         rms_kv = tl.sqrt((k*k + v*v) / 2 + 1e-6)
-        rms_decay = tl.sqrt(decay*decay + 1e-6)
-        rms_h = tl.sqrt(h_pre*h_pre + 1e-6)
+        rms_decay = tl.sqrt(decay * decay + 1e-6)
+        rms_alpha = tl.sqrt(alpha * alpha + 1e-6)
+        rms_h = tl.sqrt(h_pre * h_pre + 1e-6)
 
         r /= rms_control
         z /= rms_control
         decay /= rms_decay
-
         k /= rms_kv
         v /= rms_kv
-
         h_pre /= rms_h
-        # --------------------------------------
+        alpha /= rms_alpha
 
         # Nonlinearities
         r = tl.sigmoid(r)
         z = tl.sigmoid(z)
         decay = tl.sigmoid(decay)
+        alpha = tl.sigmoid(alpha)
 
         # Bounded kv update
         kv = (k * v) / (rms_kv * rms_kv + 1e-6)
 
-        # Memory and hidden update
-        s = decay * s + kv
+        # Gated injection via alpha
+        s = decay * s + alpha * kv
         c = tl.sigmoid(2 * (h_pre + s)) * 2.0 - 1.0
         h = (1. - z) * c + z * h
 
         tl.store(out_ptr + b * stride_o_bt + t * stride_o_bd + d, h)
 
     tl.store(s_out_ptr + b * D + d, s)
+
