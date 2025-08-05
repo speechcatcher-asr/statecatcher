@@ -352,6 +352,7 @@ class ASRModel(nn.Module):
                 raise ValueError("Mask is required for nn.LSTM models.")
 
             lengths = mask.sum(dim=1).cpu()  # Get lengths from boolean mask
+            lengths = torch.clamp(lengths, min=1)
             packed_feats = nn.utils.rnn.pack_padded_sequence(
                 feats, lengths, batch_first=True, enforce_sorted=False
             )
