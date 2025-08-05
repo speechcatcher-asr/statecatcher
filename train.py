@@ -96,11 +96,11 @@ def load_sentencepiece_model(args):
     blank_id = 0
     return sp, vocab_size, blank_id
 
-def build_model(args, device, feat_dim, vocab_size):
+def build_model(frontend, args, device, feat_dim, vocab_size):
     """Build and initialize the ASR model."""
     encoder = build_encoder(args, vocab_size)
     model = ASRModel(
-        frontend=make_frontend(args.frontend, args.batch_samplerate).to(device),
+        frontend=frontend,
         encoder=encoder,
         vocab_size=vocab_size,
         feat_dim=feat_dim,
@@ -292,6 +292,19 @@ def process_batch_item_wrapper(args):
         logging.getLogger("train").error(f"Data preprocess error: {e}; trying to leave out batch item!")
         return None
 
+
+def compute_frame_mask(sample_mask: torch.Tensor, subsample: float) -> torch.Tensor:
+    B, S = sample_mask.shape
+    T = int(S / subsample)
+    S_trim = S - (S % T)
+
+    assert S_trim <= S, f"Trim size {S_trim} exceeds original size {S}"
+
+    sample_mask = sample_mask[:, :S_trim]
+    reshaped = sample_mask.view(B, T, int(subsample))  # must cast subsample to int
+    frame_mask = reshaped.any(dim=2)
+    return frame_mask
+
 def train(args, executer=None):
     """Main training function."""
     
@@ -319,7 +332,9 @@ def train(args, executer=None):
     logger.info(f"Vocab size (output tokens): {vocab_size}")
 
     # Build frontend and infer feature dimension
-    frontend = make_frontend(args.frontend, args.batch_samplerate).to(device)
+    frontend, frontend_args = make_frontend(args.frontend, args.batch_samplerate)
+    frontend = frontend.to(device)
+
     with torch.no_grad():
         dummy = torch.zeros(int(args.target_duration * args.batch_samplerate), device=device)
         dummy = dummy.unsqueeze(0).unsqueeze(1)
@@ -328,7 +343,7 @@ def train(args, executer=None):
         feat_dim = feats.shape[-1]
 
     # Build and initialize the model
-    model = build_model(args, device, feat_dim, vocab_size)
+    model = build_model(frontend, args, device, feat_dim, vocab_size)
     #model = torch.compile(model) #, fullgraph=True, mode="max-autotune")
     logger.info(f"Model built: {args.encoder}, feat_dim={feat_dim}, vocab_size={vocab_size}")
 
@@ -463,23 +478,29 @@ def train(args, executer=None):
 
             t_begin = time.time()
             tokens, tgt_lens = prepare_tokens_and_lengths(slice_texts, sp, blank_id, device)
-            subsample = mask_tensor.size(1) // feats.size(1)
             t_end = time.time()
             debug_print(args.debug, f"Prepare_tokens_and_lengths took {t_end - t_begin:.2f}s")
 
             effective_stack = model.cfg.stack_order if model.cfg and hasattr(model.cfg, "stack_order") else 1
-            subsample = (mask_tensor.size(1) // feats.size(1)) * effective_stack
-            in_lens = (mask_tensor.sum(dim=1) // subsample).clamp(max=feats.size(1)).long().tolist()
+
+            subsample = mask_tensor.size(1) / feats.size(1)
+            subsample *= float(effective_stack)
+            frame_mask = compute_frame_mask(mask_tensor, subsample)
+            #in_lens = (mask_tensor.sum(dim=1) // subsample).clamp(max=feats.size(1)).long().tolist()
+            in_lens = (mask_tensor.sum(dim=1) / subsample).clamp(max=feats.size(1)).long().tolist()
+
+            assert feats.size(1) == frame_mask.size(1), f"Mismatch: feats={feats.size(1)} vs mask={frame_mask.size(1)}"
 
             debug_print(args.debug, f"Subsample: {subsample}")
 
-            in_lens = (mask_tensor.sum(dim=1) // subsample).clamp(max=feats.size(1)).long().tolist()
 
             for ilen, tlen in zip(in_lens, tgt_lens):
                 if ilen < tlen:
                     logger.warning(f"Input length ({ilen}) < target length ({tlen}) — may cause CTC error")
 
             debug_print(args.debug, f"Output {subsample=} and {in_lens=}")
+            debug_print(args.debug, f"Feats shape: {tuple(feats.shape)}")
+            debug_print(args.debug, f"Masks shape: {tuple(frame_mask.shape)}")
             debug_print(args.debug, f"Tokens shape: {tuple(tokens.shape)}")
             debug_print(args.debug, f"Input lengths: {in_lens}")
             debug_print(args.debug, f"Target lengths: {tgt_lens}")
@@ -495,7 +516,7 @@ def train(args, executer=None):
                 with autocast(device_type=device_str, dtype=torch.float16):
                     loss, output_state, enc_out, output_state = compute_loss(
                         mode=args.mode, criterion=criterion, model=model,
-                        feats=feats, tokens=tokens, in_lens=in_lens,
+                        feats=feats, masks=frame_mask, tokens=tokens, in_lens=in_lens,
                         tgt_lens=tgt_lens, blank_id=blank_id,
                         use_rnnt_joiner=joiner if args.mode == "rnnt" else None,
                         input_state=input_state, args=args, compact=args.compact_rnnt)
@@ -507,7 +528,7 @@ def train(args, executer=None):
             else:
                 loss, output_statie, enc_out, output_state = compute_loss(
                     mode=args.mode, criterion=criterion, model=model,
-                    feats=feats, tokens=tokens, in_lens=in_lens,
+                    feats=feats, masks=frame_mask, tokens=tokens, in_lens=in_lens,
                     tgt_lens=tgt_lens, blank_id=blank_id,
                     use_rnnt_joiner=joiner if args.mode == "rnnt" else None,
                     input_state=input_state, args=args)

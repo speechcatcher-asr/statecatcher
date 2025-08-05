@@ -39,6 +39,7 @@ def compute_loss(
     criterion: nn.Module,
     model: nn.Module,
     feats: torch.Tensor,              # (B, T, F)
+    masks: torch.Tensor,              # (B, T)
     tokens: torch.Tensor,             # (B, U)
     in_lens: torch.Tensor,            # (B,)
     tgt_lens: torch.Tensor,           # (B,)
@@ -62,7 +63,7 @@ def compute_loss(
             assert_all_detached(input_state)
 
     # Forward pass through model
-    enc_out, output_state = model(feats, input_state)  # (B, T, D)
+    enc_out, output_state = model(feats, masks, input_state)  # (B, T, D)
 
     if mode == "ctc":
         # CTC expects (T, B, V) after log_softmax
@@ -247,23 +248,36 @@ def build_encoder(args, vocab_size, feat_dim=80, is_training=True):
 
 
 def make_frontend(ftype: str, sample_rate: int):
-     if ftype == "mfcc":
-         return torchaudio.transforms.MFCC(
-             sample_rate=sample_rate,
-             n_mfcc=80,
-             log_mels=True,
-             melkwargs={"n_mels": 80}
-         )
-     elif ftype == "mel":
-         return nn.Sequential(
-             torchaudio.transforms.MelSpectrogram(
-                 sample_rate=sample_rate,
-                 n_mels=80
-             ),
-             torchaudio.transforms.AmplitudeToDB()
-         )
-     else:
-         raise ValueError(f"Unsupported frontend: {ftype}")
+    mel_kwargs = {
+        "n_fft": 400,              # 25ms window @ 16kHz
+        "win_length": 400,
+        "hop_length": 160,         # 10ms hop @ 16kHz
+        "n_mels": 80,
+        "center": False,           # don't pad the input
+        "power": 2.0,              # power spectrogram
+        "mel_scale": "htk",        # matches Kaldi / standard behavior
+    }
+
+    if ftype == "mfcc":
+        return torchaudio.transforms.MFCC(
+            sample_rate=sample_rate,
+            n_mfcc=80,
+            dct_type=2,
+            norm='ortho',
+            log_mels=True,
+            melkwargs=mel_kwargs
+        ), mel_kwargs
+    elif ftype == "mel":
+        return nn.Sequential(
+            torchaudio.transforms.MelSpectrogram(
+                sample_rate=sample_rate,
+                **mel_kwargs
+            ),
+            torchaudio.transforms.AmplitudeToDB(top_db=80.0)
+        ), mel_kwargs
+    else:
+        raise ValueError(f"Unsupported frontend: {ftype}")
+
 
 class ASRModel(nn.Module):
     def __init__(self, frontend: nn.Module, encoder, vocab_size: int, feat_dim: int, proj_dim: int, debug: bool = True):
@@ -301,57 +315,84 @@ class ASRModel(nn.Module):
          else:
              raise ValueError(f"Unknown encoder provided: {type(encoder)}")
 
-
-    def forward(self, feats, states=None):
-         # Debug shapes before any change
-         if self.debug:
-             print(f"[DEBUG] Input feats shape: {tuple(feats.shape)}")
-             if states is None:
+    def forward(self, feats, mask, states=None):
+        # Debug shapes before any change
+        if self.debug:
+            print(f"[DEBUG] Input feats shape: {tuple(feats.shape)}")
+            if states is None:
                 print(f"[DEBUG] states is None - initializing encoder with a new state.")
 
-         if self.debug:
-             print(f"[DEBUG] Feats after transpose shape: {tuple(feats.shape)}")
+        if self.debug:
+            print(f"[DEBUG] Feats after transpose shape: {tuple(feats.shape)}")
 
-         # apply input projection
-         if hasattr(self, 'proj'):
-             if self.debug:
-                 print(f"[DEBUG] Projecting feats from dim {feats.size(-1)} to {self.proj.out_features}")
-             feats = self.proj(feats)
-             if self.debug:
-                 print(f"[DEBUG] After proj shape: {tuple(feats.shape)}")
-         else:
-             if self.debug:
-                 print(f"[DEBUG] Passing feats into RNN with input dim {feats.size(-1)}")
+        # Apply input projection if needed
+        if hasattr(self, 'proj'):
+            if self.debug:
+                print(f"[DEBUG] Projecting feats from dim {feats.size(-1)} to {self.proj.out_features}")
+            feats = self.proj(feats)
+            if self.debug:
+                print(f"[DEBUG] After proj shape: {tuple(feats.shape)}")
+        else:
+            if self.debug:
+                print(f"[DEBUG] Passing feats into RNN with input dim {feats.size(-1)}")
 
-         # pad input sequence length if using xLSTM and sequence not divisible by 16 ---
-         if isinstance(self.encoder, xLSTMLarge):
-             seq_len = feats.size(1)
-             remainder = seq_len % self.input_seq_pad_factor
-             if remainder != 0:
-                 pad_len = self.input_seq_pad_factor - remainder
-                 if self.debug:
-                     print(f"[DEBUG] Padding sequence length from {seq_len} to {seq_len + pad_len}")
-                 feats = F.pad(feats, (0, 0, 0, pad_len))  # Pad time dimension (dim=1)
+        # Pad input sequence if using xLSTM
+        if isinstance(self.encoder, xLSTMLarge):
+            seq_len = feats.size(1)
+            remainder = seq_len % self.input_seq_pad_factor
+            if remainder != 0:
+                pad_len = self.input_seq_pad_factor - remainder
+                if self.debug:
+                    print(f"[DEBUG] Padding sequence length from {seq_len} to {seq_len + pad_len}")
+                feats = F.pad(feats, (0, 0, 0, pad_len))  # Pad time dimension (dim=1)
 
-         # run encoder, with or without states
-         if states is not None:
-             if self.debug:
-                 print(f"[DEBUG] Run encoder with a previous state (stateful training).")
-             logits, new_states = self.encoder(feats, states)
-         else:
-             if self.debug:
-                 print(f"[DEBUG] Run encoder with a new state.")
-             logits, new_states = self.encoder(feats)
+        # Use mask with nn.LSTM
+        if isinstance(self.encoder, nn.LSTM):
+            if mask is None:
+                raise ValueError("Mask is required for nn.LSTM models.")
 
-         if self.debug:
-             print(f"[DEBUG] Encoder output logits shape: {tuple(logits.shape)}")
+            lengths = mask.sum(dim=1).cpu()  # Get lengths from boolean mask
+            packed_feats = nn.utils.rnn.pack_padded_sequence(
+                feats, lengths, batch_first=True, enforce_sorted=False
+            )
 
-         if hasattr(self, 'classifier'):
-             # map to vocabulary for LSTM
-             logits = self.classifier(logits)
-             if self.debug:
-                 print(f"[DEBUG] After classifier shape: {tuple(logits.shape)}")
+            if self.debug:
+                print(f"[DEBUG] Packed input with lengths: {lengths.tolist()}")
 
-         return logits, new_states
+            if states is not None:
+                if self.debug:
+                    print(f"[DEBUG] Run nn.LSTM with a previous state (packed).")
+                packed_out, new_states = self.encoder(packed_feats, states)
+            else:
+                if self.debug:
+                    print(f"[DEBUG] Run nn.LSTM with a new state (packed).")
+                packed_out, new_states = self.encoder(packed_feats)
 
+            logits, _ = nn.utils.rnn.pad_packed_sequence(packed_out, batch_first=True)
+
+        else:
+            # Fallback: zero-out padded time steps
+            if mask is not None:
+                feats = feats * mask.unsqueeze(-1).float()
+                if self.debug:
+                    print(f"[DEBUG] Applied zero-masking to feats (fallback)")
+
+            if states is not None:
+                if self.debug:
+                    print(f"[DEBUG] Run encoder with a previous state (unmasked).")
+                logits, new_states = self.encoder(feats, states)
+            else:
+                if self.debug:
+                    print(f"[DEBUG] Run encoder with a new state (unmasked).")
+                logits, new_states = self.encoder(feats)
+
+        if self.debug:
+            print(f"[DEBUG] Encoder output logits shape: {tuple(logits.shape)}")
+
+        if hasattr(self, 'classifier'):
+            logits = self.classifier(logits)
+            if self.debug:
+                print(f"[DEBUG] After classifier shape: {tuple(logits.shape)}")
+
+        return logits, new_states
 
